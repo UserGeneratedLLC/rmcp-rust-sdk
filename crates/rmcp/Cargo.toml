@@ -16,6 +16,7 @@ exhaustive_enums = "warn"
 [package.metadata.docs.rs]
 features = [
   "anthropic-ext",
+  "sep-2243-draft",
   "auth",
   "auth-client-credentials-jwt",
   "base64",
@@ -124,6 +125,12 @@ elicitation = ["dep:url"]
 # claude/channel capability, 2KB truncation lint. Off by default; opt in when
 # the fleet targets Claude Code as the MCP client.
 anthropic-ext = []
+
+# Forward-looking scaffold for SEP-2243 (HTTP Header Standardization, Draft).
+# Exposes header-name constants, `Tool::with_mcp_header_param` builder, and
+# server-side header extraction. Full transport-layer plumbing lands when
+# SEP-2243 finalizes. Off by default.
+sep-2243-draft = []
 
 # reqwest http client
 __reqwest = ["dep:reqwest"]
