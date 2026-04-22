@@ -15,6 +15,7 @@ exhaustive_enums = "warn"
 
 [package.metadata.docs.rs]
 features = [
+  "anthropic-ext",
   "auth",
   "auth-client-credentials-jwt",
   "base64",
@@ -119,6 +120,10 @@ client = ["dep:tokio-stream"]
 server = ["transport-async-rw", "dep:schemars", "dep:pastey"]
 macros = ["dep:rmcp-macros", "dep:pastey"]
 elicitation = ["dep:url"]
+# Claude Code / claude-cli specific server extensions: anthropic/maxResultSizeChars,
+# claude/channel capability, 2KB truncation lint. Off by default; opt in when
+# the fleet targets Claude Code as the MCP client.
+anthropic-ext = []
 
 # reqwest http client
 __reqwest = ["dep:reqwest"]

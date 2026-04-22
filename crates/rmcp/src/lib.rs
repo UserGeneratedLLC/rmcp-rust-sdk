@@ -6,6 +6,10 @@ mod error;
 #[allow(deprecated)]
 pub use error::{Error, ErrorData, RmcpError};
 
+/// Claude Code-specific server extensions (maxResultSizeChars, claude/channel).
+/// See <https://docs.anthropic.com/en/docs/claude-code/mcp>.
+#[cfg(feature = "anthropic-ext")]
+pub mod anthropic_ext;
 /// Basic data types in MCP specification
 pub mod model;
 #[cfg(any(feature = "client", feature = "server"))]
