@@ -16,7 +16,7 @@
 
 use serde_json::Value;
 
-use crate::model::{ExtensionCapabilities, JsonObject, Tool};
+use crate::model::{ExtensionCapabilities, JsonObject, Meta, Tool};
 
 /// `_meta` key Claude Code honours on a tool's `tools/list` entry to raise the
 /// per-tool text-output size threshold past the default 25 000-token cap.
@@ -57,6 +57,38 @@ impl Tool {
         self.meta = Some(meta);
         self
     }
+}
+
+/// Build a [`Meta`] carrying the `anthropic/maxResultSizeChars` key for direct
+/// use in the `#[tool(meta = ...)]` macro attribute. The value is clamped to
+/// [`MAX_RESULT_SIZE_CHARS_CEILING`].
+///
+/// Prefer this helper in macro-driven tool routers where you cannot call
+/// [`Tool::with_anthropic_max_result_size_chars`] at construction time. The
+/// `_meta` key is silently ignored by every MCP client other than Claude Code.
+///
+/// See <https://docs.anthropic.com/en/docs/claude-code/mcp#raise-the-limit-for-a-specific-tool>.
+///
+/// # Example
+///
+/// ```ignore
+/// use rmcp::anthropic_ext::anthropic_max_result_size_chars_meta;
+///
+/// #[tool(
+///     annotations(read_only_hint = true),
+///     meta = anthropic_max_result_size_chars_meta(500_000),
+/// )]
+/// async fn big_output(&self) -> Result<Json<Resp>, String> { /* ... */ }
+/// ```
+#[must_use]
+pub fn anthropic_max_result_size_chars_meta(chars: u32) -> Meta {
+    let clamped = chars.min(MAX_RESULT_SIZE_CHARS_CEILING);
+    let mut meta = Meta::new();
+    meta.0.insert(
+        MAX_RESULT_SIZE_CHARS_META_KEY.to_string(),
+        Value::from(clamped),
+    );
+    meta
 }
 
 /// Insert the `claude/channel` extension capability into an
@@ -144,6 +176,34 @@ mod tests {
         insert_claude_channel(&mut ext);
         let stored = ext.get(CLAUDE_CHANNEL_CAPABILITY).expect("capability set");
         assert!(stored.is_empty(), "expected empty settings object");
+    }
+
+    #[test]
+    fn anthropic_max_result_size_chars_meta_under_ceiling() {
+        let meta = anthropic_max_result_size_chars_meta(100_000);
+        let stored = meta
+            .0
+            .get(MAX_RESULT_SIZE_CHARS_META_KEY)
+            .cloned()
+            .expect("key present");
+        assert_eq!(stored, Value::from(100_000u32));
+    }
+
+    #[test]
+    fn anthropic_max_result_size_chars_meta_clamps_above_ceiling() {
+        let meta = anthropic_max_result_size_chars_meta(1_000_000);
+        let stored = meta
+            .0
+            .get(MAX_RESULT_SIZE_CHARS_META_KEY)
+            .cloned()
+            .expect("key present");
+        assert_eq!(stored, Value::from(MAX_RESULT_SIZE_CHARS_CEILING));
+    }
+
+    #[test]
+    fn anthropic_max_result_size_chars_meta_is_standalone() {
+        let meta = anthropic_max_result_size_chars_meta(100_000);
+        assert_eq!(meta.0.len(), 1, "helper should only emit the size key");
     }
 
     #[test]
