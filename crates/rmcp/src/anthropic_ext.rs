@@ -14,6 +14,15 @@
 //!   that opts the channel into remote permission-relay for tool approvals.
 //! - `notifications/claude/channel` - the notification method a channel emits
 //!   to push events; payload is `{ content, meta? }`.
+//! - `notifications/claude/channel/permission_request` - inbound notification
+//!   Claude Code sends when a tool-approval dialog opens on a channel that
+//!   declared `claude/channel/permission`; payload is `{ request_id,
+//!   tool_name, description, input_preview }`. Servers parse via
+//!   [`CustomNotification::params_as`](crate::model::CustomNotification::params_as)
+//!   inside their `ServerHandler::on_custom_notification` override.
+//! - `notifications/claude/channel/permission` - outbound verdict the server
+//!   emits back; payload is `{ request_id, behavior: "allow" | "deny" }`.
+//!   Emit via [`Peer::notify_claude_channel_permission`].
 //! - `structured_with_text_fallback` - MCP 2025-11-25 spec ("a tool that
 //!   returns structured content SHOULD also return the serialized JSON in a
 //!   TextContent block") + workaround for Claude Code #41361 (blank UI when
@@ -231,6 +240,175 @@ impl Peer<RoleServer> {
             .expect("ClaudeChannelNotificationParam is always serializable");
         self.send_notification(ServerNotification::CustomNotification(
             CustomNotification::new(CLAUDE_CHANNEL_NOTIFICATION_METHOD, Some(value)),
+        ))
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel permission relay (`claude/channel/permission`)
+// ---------------------------------------------------------------------------
+
+/// JSON-RPC method Claude Code uses to forward a tool-approval prompt into a
+/// channel that declared [`CLAUDE_CHANNEL_PERMISSION_CAPABILITY`]. The server
+/// receives this as an inbound [`CustomNotification`]; parse via
+/// [`CustomNotification::params_as`](crate::model::CustomNotification::params_as)
+/// into [`ClaudeChannelPermissionRequestParam`].
+///
+/// See <https://code.claude.com/docs/en/channels-reference#relay-permission-prompts>.
+pub const CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD: &str =
+    "notifications/claude/channel/permission_request";
+
+/// JSON-RPC method the server emits back to Claude Code carrying the verdict
+/// for a prior [`CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD`]. Emit typed via
+/// [`Peer::notify_claude_channel_permission`].
+///
+/// See <https://code.claude.com/docs/en/channels-reference#relay-permission-prompts>.
+pub const CLAUDE_CHANNEL_PERMISSION_METHOD: &str = "notifications/claude/channel/permission";
+
+/// Payload of an inbound [`CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD`]
+/// notification. Claude Code sends one of these whenever a local tool-approval
+/// dialog opens on a channel that declared
+/// [`CLAUDE_CHANNEL_PERMISSION_CAPABILITY`].
+///
+/// `request_id` is five lowercase letters drawn from `a`-`z` skipping `l`; it
+/// must be echoed verbatim in the corresponding
+/// [`ClaudeChannelPermissionParam::request_id`] or Claude Code drops the
+/// verdict silently. The local terminal dialog never displays this ID.
+///
+/// See <https://code.claude.com/docs/en/channels-reference#permission-request-fields>.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+pub struct ClaudeChannelPermissionRequestParam {
+    /// Five-letter ID Claude Code issued for this dialog; echo verbatim.
+    pub request_id: String,
+    /// Tool Claude wants to invoke (e.g. `"Bash"`, `"Write"`).
+    pub tool_name: String,
+    /// Human-readable summary of the specific call; same text the local
+    /// terminal dialog shows.
+    pub description: String,
+    /// Tool arguments rendered as a JSON string, truncated by Claude Code to
+    /// ~200 characters.
+    pub input_preview: String,
+}
+
+/// Verdict the server returns in a [`CLAUDE_CHANNEL_PERMISSION_METHOD`]
+/// notification. `Allow` proceeds with the tool call; `Deny` rejects it
+/// (equivalent to answering "No" in the local dialog). Neither verdict
+/// affects future calls — each dialog is independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[expect(clippy::exhaustive_enums, reason = "verdict set is spec-defined")]
+pub enum ClaudeChannelPermissionVerdict {
+    /// Proceed with the tool call.
+    Allow,
+    /// Reject the tool call.
+    Deny,
+}
+
+/// Payload of an outbound [`CLAUDE_CHANNEL_PERMISSION_METHOD`] notification.
+/// Pair `request_id` with the value received in the corresponding inbound
+/// [`ClaudeChannelPermissionRequestParam::request_id`] exactly — Claude Code
+/// only accepts a verdict that carries an ID it issued and is still pending.
+///
+/// See <https://code.claude.com/docs/en/channels-reference#relay-permission-prompts>.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+pub struct ClaudeChannelPermissionParam {
+    /// Five-letter ID echoed from the originating
+    /// [`ClaudeChannelPermissionRequestParam::request_id`].
+    pub request_id: String,
+    /// Verdict to apply: `Allow` or `Deny`.
+    pub behavior: ClaudeChannelPermissionVerdict,
+}
+
+impl ClaudeChannelPermissionParam {
+    /// Build a verdict payload from an ID and behavior.
+    pub fn new(request_id: impl Into<String>, behavior: ClaudeChannelPermissionVerdict) -> Self {
+        Self {
+            request_id: request_id.into(),
+            behavior,
+        }
+    }
+
+    /// Shorthand for `new(id, Allow)` — the canonical autonomous-pipeline
+    /// auto-approve path.
+    #[must_use]
+    pub fn allow(request_id: impl Into<String>) -> Self {
+        Self::new(request_id, ClaudeChannelPermissionVerdict::Allow)
+    }
+
+    /// Shorthand for `new(id, Deny)`.
+    #[must_use]
+    pub fn deny(request_id: impl Into<String>) -> Self {
+        Self::new(request_id, ClaudeChannelPermissionVerdict::Deny)
+    }
+}
+
+#[cfg(feature = "server")]
+impl Peer<RoleServer> {
+    /// Push a `notifications/claude/channel/permission` verdict back to Claude
+    /// Code. Call this from
+    /// [`ServerHandler::on_custom_notification`](crate::ServerHandler::on_custom_notification)
+    /// once a [`CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD`] notification has
+    /// been parsed into a [`ClaudeChannelPermissionRequestParam`] and a
+    /// verdict has been decided. `request_id` in `params` must match the
+    /// originating request or Claude Code drops the verdict silently.
+    ///
+    /// Autonomous pipelines typically pair this with a sender-gated channel
+    /// and always emit `Allow` (no human in the loop to make the call). See
+    /// <https://code.claude.com/docs/en/channels-reference#relay-permission-prompts>.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rmcp::{
+    ///     ServerHandler,
+    ///     anthropic_ext::{
+    ///         CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD,
+    ///         ClaudeChannelPermissionParam,
+    ///         ClaudeChannelPermissionRequestParam,
+    ///     },
+    ///     model::CustomNotification,
+    ///     service::{NotificationContext, RoleServer},
+    /// };
+    ///
+    /// impl ServerHandler for MyServer {
+    ///     async fn on_custom_notification(
+    ///         &self,
+    ///         notification: CustomNotification,
+    ///         context: NotificationContext<RoleServer>,
+    ///     ) {
+    ///         if notification.method != CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD {
+    ///             return;
+    ///         }
+    ///         let Ok(Some(req)) =
+    ///             notification.params_as::<ClaudeChannelPermissionRequestParam>()
+    ///         else {
+    ///             return;
+    ///         };
+    ///         let _ = context
+    ///             .peer
+    ///             .notify_claude_channel_permission(
+    ///                 ClaudeChannelPermissionParam::allow(req.request_id),
+    ///             )
+    ///             .await;
+    ///     }
+    /// }
+    /// ```
+    pub async fn notify_claude_channel_permission(
+        &self,
+        params: ClaudeChannelPermissionParam,
+    ) -> Result<(), ServiceError> {
+        // ClaudeChannelPermissionParam contains only a `String` + a unit-like
+        // enum, so `serde_json::to_value` cannot fail for that shape.
+        let value = serde_json::to_value(&params)
+            .expect("ClaudeChannelPermissionParam is always serializable");
+        self.send_notification(ServerNotification::CustomNotification(
+            CustomNotification::new(CLAUDE_CHANNEL_PERMISSION_METHOD, Some(value)),
         ))
         .await
     }
@@ -490,5 +668,108 @@ mod tests {
             .as_text()
             .expect("final entry is text");
         assert_eq!(last_text.text, "3 items");
+    }
+
+    // ----- permission relay -------------------------------------------------
+
+    #[test]
+    fn permission_method_constants_match_spec() {
+        assert_eq!(
+            CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD,
+            "notifications/claude/channel/permission_request"
+        );
+        assert_eq!(
+            CLAUDE_CHANNEL_PERMISSION_METHOD,
+            "notifications/claude/channel/permission"
+        );
+    }
+
+    #[test]
+    fn permission_request_param_deserializes_from_claude_code_payload() {
+        let raw = serde_json::json!({
+            "request_id": "abcde",
+            "tool_name": "Bash",
+            "description": "list the files in this directory",
+            "input_preview": "{\"command\": \"ls\"}"
+        });
+        let parsed: ClaudeChannelPermissionRequestParam =
+            serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(parsed.request_id, "abcde");
+        assert_eq!(parsed.tool_name, "Bash");
+        assert_eq!(parsed.description, "list the files in this directory");
+        assert_eq!(parsed.input_preview, "{\"command\": \"ls\"}");
+    }
+
+    #[test]
+    fn permission_verdict_serializes_snake_case() {
+        let allow = serde_json::to_value(ClaudeChannelPermissionVerdict::Allow).expect("serialize");
+        let deny = serde_json::to_value(ClaudeChannelPermissionVerdict::Deny).expect("serialize");
+        assert_eq!(allow, serde_json::Value::String("allow".into()));
+        assert_eq!(deny, serde_json::Value::String("deny".into()));
+    }
+
+    #[test]
+    fn permission_verdict_round_trips() {
+        for v in [
+            ClaudeChannelPermissionVerdict::Allow,
+            ClaudeChannelPermissionVerdict::Deny,
+        ] {
+            let json = serde_json::to_value(v).expect("serialize");
+            let back: ClaudeChannelPermissionVerdict =
+                serde_json::from_value(json).expect("deserialize");
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn permission_param_wire_shape_matches_spec() {
+        let param = ClaudeChannelPermissionParam::allow("abcde");
+        let json = serde_json::to_value(&param).expect("serialize");
+        assert_eq!(json["request_id"], "abcde");
+        assert_eq!(json["behavior"], "allow");
+        assert_eq!(
+            json.as_object().map(serde_json::Map::len),
+            Some(2),
+            "payload carries exactly `request_id` and `behavior`"
+        );
+    }
+
+    #[test]
+    fn permission_param_allow_and_deny_constructors() {
+        let allow = ClaudeChannelPermissionParam::allow("fghij");
+        assert_eq!(allow.request_id, "fghij");
+        assert_eq!(allow.behavior, ClaudeChannelPermissionVerdict::Allow);
+
+        let deny = ClaudeChannelPermissionParam::deny("klmno");
+        assert_eq!(deny.request_id, "klmno");
+        assert_eq!(deny.behavior, ClaudeChannelPermissionVerdict::Deny);
+    }
+
+    #[test]
+    fn permission_request_parseable_via_custom_notification_params_as() {
+        // Mirrors the consumer path: inbound CustomNotification -> params_as::<T>().
+        use crate::model::CustomNotification;
+
+        let payload = serde_json::json!({
+            "request_id": "pqrst",
+            "tool_name": "Write",
+            "description": "Create new file README.md",
+            "input_preview": "{\"path\":\"./README.md\",\"content\":\"# Proj...\"}"
+        });
+        let notification = CustomNotification::new(
+            CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD,
+            Some(payload.clone()),
+        );
+        assert_eq!(
+            notification.method,
+            CLAUDE_CHANNEL_PERMISSION_REQUEST_METHOD
+        );
+
+        let parsed: ClaudeChannelPermissionRequestParam = notification
+            .params_as()
+            .expect("params_as succeeds")
+            .expect("params were Some");
+        assert_eq!(parsed.request_id, "pqrst");
+        assert_eq!(parsed.tool_name, "Write");
     }
 }
