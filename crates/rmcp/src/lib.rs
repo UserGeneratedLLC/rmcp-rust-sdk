@@ -7,15 +7,11 @@ mod error;
 pub use error::{Error, ErrorData, RmcpError};
 
 /// Claude Code-specific server extensions (maxResultSizeChars, claude/channel).
-/// See <https://docs.anthropic.com/en/docs/claude-code/mcp>.
+/// See <https://docs.claude.com/en/docs/claude-code/mcp>.
 #[cfg(feature = "anthropic-ext")]
 pub mod anthropic_ext;
 /// Basic data types in MCP specification
 pub mod model;
-/// Forward-looking scaffold for SEP-2243 (HTTP Header Standardization, Draft).
-/// See <https://modelcontextprotocol.io/seps/2243-http-standardization>.
-#[cfg(feature = "sep-2243-draft")]
-pub mod sep2243_draft;
 #[cfg(any(feature = "client", feature = "server"))]
 pub mod service;
 #[cfg(feature = "client")]
