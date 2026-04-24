@@ -47,9 +47,9 @@ use crate::model::ServerJsonRpcMessage;
 use crate::{
     error::ErrorData as McpError,
     model::{
-        CancelledNotification, CancelledNotificationParam, Extensions, GetExtensions, GetMeta,
-        JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Meta,
-        NumberOrString, ProgressToken, RequestId,
+        CancelledNotification, CancelledNotificationParam, ErrorCode, Extensions, GetExtensions,
+        GetMeta, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+        JsonRpcResponse, Meta, NumberOrString, ProgressToken, RequestId,
     },
     transport::{DynamicTransportError, IntoTransport, Transport},
 };
@@ -970,7 +970,13 @@ where
                                     JsonRpcMessage::response(result, id)
                                 }
                                 Err(error) => {
-                                    tracing::warn!(%id, ?error, "response error");
+                                    // Method-not-found is expected client probing
+                                    // (e.g. unsupported `resources/subscribe`); demote to debug.
+                                    if error.code == ErrorCode::METHOD_NOT_FOUND {
+                                        tracing::debug!(%id, ?error, "response error");
+                                    } else {
+                                        tracing::warn!(%id, ?error, "response error");
+                                    }
                                     JsonRpcMessage::error(error, id)
                                 }
                             };

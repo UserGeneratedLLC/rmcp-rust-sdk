@@ -891,7 +891,7 @@ where
                     // with the same Last-Event-ID in an infinite loop. An empty
                     // 200 cleanly terminates the EventSource without delivering
                     // events from a different stream.
-                    tracing::warn!("Resume failed ({e}), returning empty stream");
+                    tracing::debug!("Resume failed ({e}), returning empty stream");
                     return Ok(sse_stream_response(
                         futures::stream::empty(),
                         None,
