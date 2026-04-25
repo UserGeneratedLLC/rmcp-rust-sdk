@@ -34,10 +34,10 @@ tracing-subscriber = { version = "0.3", features = [
 futures = "0.3"
 rand = { version = "0.10", features = ["std"] }
 axum = { version = "0.8", features = ["macros"] }
-schemars = "1.0"
+schemars = "1.2"
 reqwest = { version = "0.13.2", features = ["json"] }
 chrono = "0.4"
-uuid = { version = "1.6", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 serde_urlencoded = "0.7"
 askama = { version = "0.15" }
 tower-http = { version = "0.6", features = ["cors"] }
