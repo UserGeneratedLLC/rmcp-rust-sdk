@@ -29,6 +29,15 @@
 //!   `structuredContent` fails `outputSchema.safeParse`). Pushes a
 //!   human-readable summary `Content::text` alongside the `Json<T>` structured
 //!   value.
+//! - `normalize_call_tool_result` - silently strips `structuredContent` when
+//!   it serializes to an empty object (`{}`). Wired into `ToolRouter::call`
+//!   so every tool routed through `#[tool_router]` is normalized
+//!   automatically. Lets Claude Code surface `content[]` extras
+//!   (`resource_link` / `image` / summary text) for tools whose response
+//!   struct serializes to `{}` (full-viewport screenshots, artifact-only
+//!   downloads with `inline=false`, count-only thumbnail tools, etc.) —
+//!   Claude Code shadows every block in `content[]` whenever
+//!   `structuredContent` is set, even when empty.
 //! - `lint::warn_if_over_2kb` - pure `tracing::warn!` helper catching Claude
 //!   Code's silent 2 KB truncation of tool descriptions and server
 //!   `instructions`.
@@ -435,6 +444,17 @@ impl Peer<RoleServer> {
 /// `text_summary` receives a borrow of the value so callers can render fields
 /// without cloning.
 ///
+/// # Empty-structured normalization
+///
+/// When `value` serializes to an empty object `{}` (e.g. a response struct
+/// whose only fields are `Option<...>` skipped via `skip_serializing_if`),
+/// the resulting `structuredContent: {}` would shadow every extra block
+/// pushed onto `content[]` afterward (`resource_link`, `image`, summary text)
+/// on Claude Code — see [`normalize_call_tool_result`]. The normalizer is
+/// wired into `ToolRouter::call` so every tool routed through
+/// `#[tool_router]` is stripped automatically; you do not need to hand-strip
+/// empties at call sites.
+///
 /// # Example
 ///
 /// ```ignore
@@ -458,6 +478,48 @@ where
     let mut result = Json(value).into_call_tool_result()?;
     result.content.push(Content::text(summary));
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// CallToolResult normalization (`normalize_call_tool_result`)
+// ---------------------------------------------------------------------------
+
+/// Silently strip `structuredContent` when it serializes to an empty object
+/// `{}`.
+///
+/// Claude Code surfaces only `structuredContent` to the model when set, even
+/// when `{}`. Every other block in `content[]` (`resource_link`, `image`,
+/// human-readable summary text) gets dropped from the model-visible payload.
+/// Dropping the redundant `{}` envelope unblocks the model seeing the extras
+/// callers pushed onto `content[]`. The serialized JSON dump auto-pushed
+/// onto `content[0]` by [`Json<T>::into_call_tool_result`] already carries
+/// the same payload, so this normalization is information-preserving.
+///
+/// Covers every tool whose response struct serializes to `{}` —
+/// full-viewport screenshots, artifact-only downloads with `inline=false`,
+/// count-only thumbnail tools, etc. The populated-structured + extras case
+/// (someone adds a populated field to a response struct that also pushes a
+/// `resource_link` / `image`) is silently left alone here; treat it as a
+/// per-tool design constraint instead — keep response structs empty when
+/// the call site pushes extras onto `content[]`, or surface the structured
+/// field via a `Content::text` block.
+///
+/// Wired into [`ToolRouter::call`](crate::handler::server::tool::ToolRouter)
+/// so every tool routed through `#[tool_router]` is normalized
+/// automatically. Tool authors do not call this directly.
+///
+/// See <https://github.com/anthropics/claude-code/issues/41361> for the
+/// related rendering bug; this normalizer addresses the closely-related
+/// "structured exists but is empty" failure mode.
+#[cfg(feature = "server")]
+pub fn normalize_call_tool_result(result: &mut CallToolResult) {
+    let is_empty_object = matches!(
+        result.structured_content.as_ref(),
+        Some(Value::Object(map)) if map.is_empty()
+    );
+    if is_empty_object {
+        result.structured_content = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +730,88 @@ mod tests {
             .as_text()
             .expect("final entry is text");
         assert_eq!(last_text.text, "3 items");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn normalize_strips_empty_object() {
+        use crate::model::CallToolResult;
+
+        let mut result = CallToolResult::structured(serde_json::json!({}));
+        assert!(
+            result.structured_content.is_some(),
+            "test setup: structured starts populated"
+        );
+        normalize_call_tool_result(&mut result);
+        assert!(
+            result.structured_content.is_none(),
+            "empty `{{}}` envelope must be stripped so Claude Code surfaces content[]"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn normalize_keeps_populated_structured() {
+        use crate::model::CallToolResult;
+
+        let mut result = CallToolResult::structured(serde_json::json!({"k": "v"}));
+        normalize_call_tool_result(&mut result);
+        let stored = result
+            .structured_content
+            .as_ref()
+            .expect("populated structured must survive normalization");
+        assert_eq!(stored, &serde_json::json!({"k": "v"}));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn normalize_keeps_populated_structured_with_extras_default() {
+        use crate::model::{CallToolResult, Content, RawResource};
+
+        let mut result = CallToolResult::structured(serde_json::json!({"k": "v"}));
+        let raw = RawResource::new("studio://download/uuid/file.png", "file.png");
+        result.content.push(Content::resource_link(raw));
+
+        normalize_call_tool_result(&mut result);
+
+        // Latent footgun: populated structured + extras is intentionally not
+        // auto-stripped. Tool authors are expected to keep response structs
+        // empty when pushing resource_link / image extras.
+        assert!(
+            result.structured_content.is_some(),
+            "default normalizer leaves populated structured alone, even with extras"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn normalize_leaves_none_structured_alone() {
+        use crate::model::{CallToolResult, Content};
+
+        let mut result = CallToolResult::success(vec![Content::text("hi")]);
+        assert!(result.structured_content.is_none());
+        normalize_call_tool_result(&mut result);
+        assert!(
+            result.structured_content.is_none(),
+            "None structured stays None"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn normalize_leaves_non_object_structured_alone() {
+        use crate::model::CallToolResult;
+
+        // Json<T>::into_call_tool_result always emits an Object, but
+        // CallToolResult::structured(value) accepts arbitrary JSON. Defensive
+        // check that a non-object Value (array, string, etc.) doesn't get
+        // matched as "empty" by the normalizer.
+        let mut result = CallToolResult::structured(serde_json::json!([]));
+        normalize_call_tool_result(&mut result);
+        assert!(
+            result.structured_content.is_some(),
+            "non-object structured (array, scalar, etc.) is left untouched"
+        );
     }
 
     // ----- permission relay -------------------------------------------------

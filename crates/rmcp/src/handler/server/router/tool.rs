@@ -547,7 +547,18 @@ where
             .get(name)
             .ok_or_else(|| crate::ErrorData::invalid_params("tool not found", None))?;
 
-        let result = (item.call)(context).await?;
+        // `let mut` is required when `anthropic-ext` is on for the
+        // post-dispatch normalizer; `let _ = name;` keeps the binding live for
+        // the warning-free no-feature build below.
+        #[allow(unused_mut)]
+        let mut result = (item.call)(context).await?;
+
+        // Strip empty `structuredContent: {}` so Claude Code surfaces
+        // `content[]` extras (resource_link / image / summary text). See
+        // `anthropic_ext::normalize_call_tool_result` for the rationale and
+        // claude-code#41361 for the related rendering bug.
+        #[cfg(feature = "anthropic-ext")]
+        crate::anthropic_ext::normalize_call_tool_result(&mut result);
 
         Ok(result)
     }
@@ -639,5 +650,56 @@ mod tests {
             .expect_err("disabled tool should reject");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(err.message, "tool not found");
+    }
+
+    #[cfg(feature = "anthropic-ext")]
+    #[tokio::test]
+    async fn router_call_strips_empty_structured_content() {
+        use crate::model::{Content, RawResource};
+
+        let service = DummyService;
+        let router = ToolRouter::new().with_route(ToolRoute::new_dyn(
+            crate::model::Tool::new("empty_struct_tool", "test", Arc::new(Default::default())),
+            |_ctx| {
+                Box::pin(async {
+                    // Mirrors the screenshot full-viewport case: response
+                    // serializes to `{}`, plus a resource_link pushed onto
+                    // content[]. Without normalization, Claude Code shadows
+                    // the resource_link.
+                    let mut result = CallToolResult::structured(serde_json::json!({}));
+                    let raw = RawResource::new("studio://download/uuid/x.png", "x.png");
+                    result.content.push(Content::resource_link(raw));
+                    Ok(result)
+                })
+            },
+        ));
+
+        let id_provider: Arc<dyn crate::service::RequestIdProvider> =
+            Arc::new(AtomicU32RequestIdProvider::default());
+        let (peer, _rx) = Peer::<RoleServer>::new(id_provider, None);
+        let ctx = crate::handler::server::tool::ToolCallContext::new(
+            &service,
+            CallToolRequestParams {
+                meta: None,
+                name: Cow::Borrowed("empty_struct_tool"),
+                arguments: None,
+                task: None,
+            },
+            RequestContext::new(NumberOrString::Number(1), peer),
+        );
+
+        let result = router.call(ctx).await.expect("call succeeds");
+        assert!(
+            result.structured_content.is_none(),
+            "router must strip empty `{{}}` structuredContent post-dispatch \
+             so Claude Code surfaces content[] extras"
+        );
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|c| c.raw.as_resource_link().is_some()),
+            "resource_link must survive normalization on content[]"
+        );
     }
 }
