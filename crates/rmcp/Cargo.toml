@@ -89,7 +89,6 @@ which = { version = "8", optional = true }
 # tokio-tungstenite ={ version = "0.26", optional = true }
 
 # for http-server transport
-rand = { version = "0.10", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 http-body = { version = "1", optional = true }
@@ -136,7 +135,6 @@ reqwest-native-tls = ["__reqwest", "reqwest?/native-tls"]
 
 server-side-http = [
   "uuid",
-  "dep:rand",
   "dep:tokio-stream",
   "dep:http",
   "dep:http-body",

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(server)* Normalise bare boolean subschemas (`true` / `false`) in generated `inputSchema`, `outputSchema`, and `ElicitationSchema` to their object-form equivalents (`{}` / `{"not": {}}`) before serialisation. Triggered by `serde_json::Value` field expansions, `Vec<serde_json::Value>`, `BTreeMap<String, serde_json::Value>`, and `#[serde(deny_unknown_fields)]`. Claude Code's `LocalMcpServerManager` schema walker throws `TypeError: Cannot use 'in' operator to search for 'properties' in <bool>` on bare booleans, silently dropping the entire server's tool list ([anthropics/claude-code#50194](https://github.com/anthropics/claude-code/issues/50194), [#25081](https://github.com/anthropics/claude-code/issues/25081)). The fix is unconditional — boolean subschemas are spec-legal per JSON Schema 2020-12 §4.3.2, but real-world MCP clients can't always handle them, so emit object form universally.
+
 ## [1.5.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v1.4.0...rmcp-v1.5.0) - 2026-04-16
 
 ### Added

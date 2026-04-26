@@ -1180,7 +1180,18 @@ impl ElicitationSchema {
         let mut settings = SchemaSettings::draft07();
         settings.transforms = vec![Box::new(schemars::transform::AddNullable::default())];
         let generator = settings.into_generator();
-        let schema = generator.into_root_schema_for::<T>();
+        let mut schema = generator.into_root_schema_for::<T>();
+
+        // See `handler::server::common::schema_for_type` for full rationale.
+        // `serde_json::Value` / `Vec<Value>` / `BTreeMap<_, Value>` /
+        // `#[serde(deny_unknown_fields)]` produce bare boolean subschemas
+        // that crash Claude Code's `LocalMcpServerManager` schema walker
+        // (anthropics/claude-code#50194). Normalise to object form. Applied
+        // via `transform_subschemas` so a degenerate boolean root falls
+        // through to the existing non-object-root panic below.
+        let mut replace = schemars::transform::ReplaceBoolSchemas::default();
+        schemars::transform::transform_subschemas(&mut replace, &mut schema);
+
         let object = serde_json::to_value(schema).expect("failed to serialize schema");
         match object {
             serde_json::Value::Object(object) => Self::from_json_schema(object),
