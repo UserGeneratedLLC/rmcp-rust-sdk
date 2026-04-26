@@ -523,6 +523,73 @@ pub fn normalize_call_tool_result(result: &mut CallToolResult) {
 }
 
 // ---------------------------------------------------------------------------
+// Test support — public helpers for unit-testing custom `ServerHandler` impls
+// ---------------------------------------------------------------------------
+
+/// Public test helpers for unit-testing custom [`ServerHandler`](crate::ServerHandler)
+/// impls — in particular hand-rolled `call_tool` overrides — from outside the
+/// `rmcp` crate.
+///
+/// Workspace MCPs that wrap their `tool_router` in
+/// `Arc<RwLock<ToolRouter<Self>>>` (to support runtime mutation, e.g.
+/// `load_tool_group`) cannot use rmcp's `#[tool_handler]` macro and must
+/// hand-roll [`ServerHandler::call_tool`](crate::ServerHandler::call_tool).
+/// That dispatch path bypasses [`ToolRouter::call`](crate::handler::server::router::tool::ToolRouter)
+/// and therefore the post-dispatch [`normalize_call_tool_result`] hook —
+/// each consumer must call the normalizer manually inside its hand-rolled
+/// `call_tool`. The helpers in this module make it possible to drive that
+/// custom dispatch path from a unit test without spinning up a full
+/// `serve_server` / transport stack.
+///
+/// All helpers are gated on the `server` feature; the throwaway peer's
+/// outbound channel is dropped immediately, so any peer-bound notifications
+/// the tool body emits silently no-op.
+#[cfg(feature = "server")]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use crate::{
+        RoleServer,
+        model::NumberOrString,
+        service::{AtomicU32RequestIdProvider, Peer, RequestContext, RequestIdProvider},
+    };
+
+    /// Build a [`RequestContext<RoleServer>`] suitable for unit-testing
+    /// [`ServerHandler::call_tool`](crate::ServerHandler::call_tool) (and
+    /// other server methods that take a request context).
+    ///
+    /// Internally constructs a throwaway [`Peer<RoleServer>`] via the
+    /// crate-internal constructor; the receiving channel is dropped, so any
+    /// peer-bound notifications the tool body emits silently no-op. The
+    /// request id is fixed to `1`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rmcp::{
+    ///     ServerHandler,
+    ///     anthropic_ext::test_support::request_context_for_test,
+    ///     model::CallToolRequestParams,
+    /// };
+    ///
+    /// # async fn smoke<S: ServerHandler>(server: &S) {
+    /// let req: CallToolRequestParams =
+    ///     serde_json::from_value(serde_json::json!({ "name": "ping" })).unwrap();
+    /// let ctx = request_context_for_test();
+    /// let result = server.call_tool(req, ctx).await.expect("call_tool");
+    /// // ... assertions ...
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn request_context_for_test() -> RequestContext<RoleServer> {
+        let id_provider: Arc<dyn RequestIdProvider> =
+            Arc::new(AtomicU32RequestIdProvider::default());
+        let (peer, _rx) = Peer::<RoleServer>::new(id_provider, None);
+        RequestContext::new(NumberOrString::Number(1), peer)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lint helpers
 // ---------------------------------------------------------------------------
 
@@ -812,6 +879,21 @@ mod tests {
             result.structured_content.is_some(),
             "non-object structured (array, scalar, etc.) is left untouched"
         );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_support_request_context_constructs() {
+        // Sanity check: the public test helper produces a usable
+        // RequestContext<RoleServer> that consumer crates can pass into a
+        // hand-rolled ServerHandler::call_tool from unit tests.
+        let ctx = test_support::request_context_for_test();
+        match ctx.id {
+            crate::model::NumberOrString::Number(n) => assert_eq!(n, 1),
+            crate::model::NumberOrString::String(_) => {
+                panic!("request_context_for_test() should produce a numeric id")
+            }
+        }
     }
 
     // ----- permission relay -------------------------------------------------
