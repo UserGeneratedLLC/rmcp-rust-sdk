@@ -5,11 +5,15 @@ use syn::{Expr, Ident, ImplItemFn, LitStr, ReturnType, parse_quote};
 
 use crate::common::extract_doc_line;
 
-/// Check if a type is Json<T> and extract the inner type T
+/// Check if a type is `Json<T>` or `JsonAndArtifact<T>` and extract the inner
+/// type `T`. Both wrappers carry the same structured payload contract from
+/// the macro's perspective; `JsonAndArtifact<T>` additionally appends extra
+/// `Content` blocks (e.g. a `resource_link`) to the tool result, but its
+/// `outputSchema` is still derived from the inner `T`.
 fn extract_json_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     if let syn::Type::Path(type_path) = ty {
         if let Some(last_segment) = type_path.path.segments.last() {
-            if last_segment.ident == "Json" {
+            if last_segment.ident == "Json" || last_segment.ident == "JsonAndArtifact" {
                 if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
                     if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
                         return Some(inner_type);
@@ -21,16 +25,17 @@ fn extract_json_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     None
 }
 
-/// Extract schema expression from a function's return type
-/// Handles patterns like Json<T> and Result<Json<T>, E>
+/// Extract schema expression from a function's return type.
+/// Handles `Json<T>` / `JsonAndArtifact<T>` and `Result<Json<T> | JsonAndArtifact<T>, E>`.
 fn extract_schema_from_return_type(ret_type: &syn::Type) -> Option<Expr> {
-    // First, try direct Json<T>
+    // First, try direct Json<T> / JsonAndArtifact<T>
     if let Some(inner_type) = extract_json_inner_type(ret_type) {
         return syn::parse2::<Expr>(quote! {
             rmcp::handler::server::tool::schema_for_output::<#inner_type>()
                 .unwrap_or_else(|e| {
                     panic!(
-                        "Invalid output schema for Json<{}>: {}",
+                        "Invalid output schema for Json<{}> / JsonAndArtifact<{}>: {}",
+                        std::any::type_name::<#inner_type>(),
                         std::any::type_name::<#inner_type>(),
                         e
                     )
@@ -39,7 +44,7 @@ fn extract_schema_from_return_type(ret_type: &syn::Type) -> Option<Expr> {
         .ok();
     }
 
-    // Then, try Result<Json<T>, E>
+    // Then, try Result<Json<T> | JsonAndArtifact<T>, E>
     let type_path = match ret_type {
         syn::Type::Path(path) => path,
         _ => return None,
@@ -67,7 +72,8 @@ fn extract_schema_from_return_type(ret_type: &syn::Type) -> Option<Expr> {
         rmcp::handler::server::tool::schema_for_output::<#inner_type>()
             .unwrap_or_else(|e| {
                 panic!(
-                    "Invalid output schema for Result<Json<{}>, E>: {}",
+                    "Invalid output schema for Result<Json<{}> | JsonAndArtifact<{}>, E>: {}",
+                    std::any::type_name::<#inner_type>(),
                     std::any::type_name::<#inner_type>(),
                     e
                 )

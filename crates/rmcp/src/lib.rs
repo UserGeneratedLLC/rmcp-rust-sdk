@@ -19,7 +19,7 @@ pub use handler::client::ClientHandler;
 #[cfg(feature = "server")]
 pub use handler::server::ServerHandler;
 #[cfg(feature = "server")]
-pub use handler::server::wrapper::Json;
+pub use handler::server::wrapper::{Json, JsonAndArtifact};
 #[cfg(any(feature = "client", feature = "server"))]
 pub use service::{Peer, Service, ServiceError, ServiceExt};
 #[cfg(feature = "client")]

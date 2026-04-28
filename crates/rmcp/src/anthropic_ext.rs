@@ -32,12 +32,13 @@
 //! - `normalize_call_tool_result` - silently strips `structuredContent` when
 //!   it serializes to an empty object (`{}`). Wired into `ToolRouter::call`
 //!   so every tool routed through `#[tool_router]` is normalized
-//!   automatically. Lets Claude Code surface `content[]` extras
-//!   (`resource_link` / `image` / summary text) for tools whose response
-//!   struct serializes to `{}` (full-viewport screenshots, artifact-only
-//!   downloads with `inline=false`, count-only thumbnail tools, etc.) —
-//!   Claude Code shadows every block in `content[]` whenever
-//!   `structuredContent` is set, even when empty.
+//!   automatically. Claude Code's empty-`{}` shadow bug — and *only* the
+//!   empty-`{}` case — drops every block in `content[]`; populated
+//!   `structuredContent` coexists fine with `content[]` extras
+//!   (`resource_link` / `image` / summary text). Empirically verified
+//!   against Claude Code; spec-side, MCP 2025-11-25 has no precedence
+//!   rule between `content[]` and `structuredContent` (SEP #2200 still
+//!   in flight).
 //! - `lint::warn_if_over_2kb` - pure `tracing::warn!` helper catching Claude
 //!   Code's silent 2 KB truncation of tool descriptions and server
 //!   `instructions`.
@@ -487,30 +488,38 @@ where
 /// Silently strip `structuredContent` when it serializes to an empty object
 /// `{}`.
 ///
-/// Claude Code surfaces only `structuredContent` to the model when set, even
-/// when `{}`. Every other block in `content[]` (`resource_link`, `image`,
-/// human-readable summary text) gets dropped from the model-visible payload.
-/// Dropping the redundant `{}` envelope unblocks the model seeing the extras
-/// callers pushed onto `content[]`. The serialized JSON dump auto-pushed
-/// onto `content[0]` by [`Json<T>::into_call_tool_result`] already carries
-/// the same payload, so this normalization is information-preserving.
+/// Claude Code's empty-`{}` shadow bug: when `structuredContent` is
+/// `Some(Value::Object({}))`, Claude Code surfaces only that empty
+/// envelope to the model and drops every block in `content[]`
+/// (`resource_link`, `image`, human-readable summary text). Stripping
+/// the redundant `{}` envelope server-side unblocks the model seeing the
+/// extras. The serialized JSON dump auto-pushed onto `content[0]` by
+/// [`Json<T>::into_call_tool_result`] already carries the same payload
+/// (which is `null` / `{}` here), so this normalization is
+/// information-preserving.
 ///
-/// Covers every tool whose response struct serializes to `{}` —
-/// full-viewport screenshots, artifact-only downloads with `inline=false`,
-/// count-only thumbnail tools, etc. The populated-structured + extras case
-/// (someone adds a populated field to a response struct that also pushes a
-/// `resource_link` / `image`) is silently left alone here; treat it as a
-/// per-tool design constraint instead — keep response structs empty when
-/// the call site pushes extras onto `content[]`, or surface the structured
-/// field via a `Content::text` block.
+/// Populated `structuredContent` does NOT shadow `content[]` — both
+/// surface to the model side-by-side. Empirically verified against
+/// Claude Code; the MCP 2025-11-25 spec has no precedence rule between
+/// the two fields (SEP #2200 still in flight). The empty-`{}` case is
+/// the only known shadow trigger and the only thing this normalizer
+/// addresses.
+///
+/// Covers tools whose response struct serializes to `{}` — full-viewport
+/// screenshots, artifact-only downloads with `inline=false`, count-only
+/// thumbnail tools, and any tool that conditionally omits every field
+/// (`Option<...>` with `skip_serializing_if`). Tools with a populated
+/// structured response and `content[]` extras (e.g. cropped screenshots
+/// emitting a populated `crop_bounds` alongside a `resource_link`) need
+/// no special handling — both fields reach the model.
 ///
 /// Wired into [`ToolRouter::call`](crate::handler::server::tool::ToolRouter)
 /// so every tool routed through `#[tool_router]` is normalized
 /// automatically. Tool authors do not call this directly.
 ///
 /// See <https://github.com/anthropics/claude-code/issues/41361> for the
-/// related rendering bug; this normalizer addresses the closely-related
-/// "structured exists but is empty" failure mode.
+/// adjacent `outputSchema.safeParse` blank-UI bug; that's a different
+/// failure mode, not addressed by this normalizer.
 #[cfg(feature = "server")]
 pub fn normalize_call_tool_result(result: &mut CallToolResult) {
     let is_empty_object = matches!(
@@ -832,7 +841,7 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
-    fn normalize_keeps_populated_structured_with_extras_default() {
+    fn normalize_keeps_populated_structured_alongside_extras() {
         use crate::model::{CallToolResult, Content, RawResource};
 
         let mut result = CallToolResult::structured(serde_json::json!({"k": "v"}));
@@ -841,12 +850,13 @@ mod tests {
 
         normalize_call_tool_result(&mut result);
 
-        // Latent footgun: populated structured + extras is intentionally not
-        // auto-stripped. Tool authors are expected to keep response structs
-        // empty when pushing resource_link / image extras.
+        // Intended behavior: populated structured + extras coexist fine.
+        // Empirically verified against Claude Code — only the empty-{}
+        // case shadows content[]. Tools that emit a resource_link
+        // alongside a populated typed body need no special handling.
         assert!(
             result.structured_content.is_some(),
-            "default normalizer leaves populated structured alone, even with extras"
+            "populated structuredContent survives alongside content[] extras"
         );
     }
 
