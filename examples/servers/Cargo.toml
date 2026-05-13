@@ -39,7 +39,7 @@ reqwest = { version = "0.13.3", features = ["json"] }
 chrono = "0.4"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 serde_urlencoded = "0.7"
-askama = { version = "0.15" }
+askama = { version = "0.16" }
 tower-http = { version = "0.6", features = ["cors"] }
 hyper-util = { version = "0", features = ["server"] }
 tokio-util = { version = "0.7" }
@@ -108,3 +108,7 @@ path = "src/calculator_stdio.rs"
 [[example]]
 name = "elicitation_enum_select"
 path = "src/elicitation_enum_inference.rs"
+
+[[example]]
+name = "servers_task_stdio"
+path = "src/task_stdio.rs"
