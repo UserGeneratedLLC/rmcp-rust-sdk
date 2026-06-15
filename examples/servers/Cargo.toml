@@ -35,12 +35,12 @@ futures = "0.3"
 rand = { version = "0.10", features = ["std"] }
 axum = { version = "0.8", features = ["macros"] }
 schemars = "1.2"
-reqwest = { version = "0.13.3", features = ["json"] }
+reqwest = { version = "0.13.4", features = ["json"] }
 chrono = "0.4"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 serde_urlencoded = "0.7"
 askama = { version = "0.16" }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 hyper-util = { version = "0", features = ["server"] }
 tokio-util = { version = "0.7" }
 url = "2.5"
