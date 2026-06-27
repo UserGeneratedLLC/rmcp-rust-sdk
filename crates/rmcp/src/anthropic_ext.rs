@@ -61,7 +61,7 @@ use crate::model::{ExperimentalCapabilities, JsonObject, Meta, Tool};
 use crate::{
     RoleServer,
     handler::server::{tool::IntoCallToolResult, wrapper::Json},
-    model::{CallToolResult, Content, CustomNotification, ServerNotification},
+    model::{CallToolResult, ContentBlock, CustomNotification, ServerNotification},
     service::{Peer, ServiceError},
 };
 
@@ -477,7 +477,7 @@ where
 {
     let summary = text_summary(&value);
     let mut result = Json(value).into_call_tool_result()?;
-    result.content.push(Content::text(summary));
+    result.content.push(ContentBlock::text(summary));
     Ok(result)
 }
 
@@ -842,11 +842,11 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn normalize_keeps_populated_structured_alongside_extras() {
-        use crate::model::{CallToolResult, Content, RawResource};
+        use crate::model::{CallToolResult, ContentBlock, Resource};
 
         let mut result = CallToolResult::structured(serde_json::json!({"k": "v"}));
-        let raw = RawResource::new("studio://download/uuid/file.png", "file.png");
-        result.content.push(Content::resource_link(raw));
+        let raw = Resource::new("studio://download/uuid/file.png", "file.png");
+        result.content.push(ContentBlock::resource_link(raw));
 
         normalize_call_tool_result(&mut result);
 
@@ -863,9 +863,9 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn normalize_leaves_none_structured_alone() {
-        use crate::model::{CallToolResult, Content};
+        use crate::model::{CallToolResult, ContentBlock};
 
-        let mut result = CallToolResult::success(vec![Content::text("hi")]);
+        let mut result = CallToolResult::success(vec![ContentBlock::text("hi")]);
         assert!(result.structured_content.is_none());
         normalize_call_tool_result(&mut result);
         assert!(

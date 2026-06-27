@@ -49,8 +49,8 @@ const_string!(ArrayTypeConst = "array");
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
-#[expect(clippy::exhaustive_enums, reason = "intentionally exhaustive")]
-pub enum PrimitiveSchema {
+#[non_exhaustive]
+pub enum PrimitiveSchemaDefinition {
     /// Enum property (explicit enum schema)
     Enum(EnumSchema),
     /// String property (with optional enum constraint)
@@ -63,6 +63,9 @@ pub enum PrimitiveSchema {
     Boolean(BooleanSchema),
 }
 
+#[deprecated(since = "2.0.0", note = "Renamed to PrimitiveSchemaDefinition")]
+pub type PrimitiveSchema = PrimitiveSchemaDefinition;
+
 // =============================================================================
 // STRING SCHEMA
 // =============================================================================
@@ -71,7 +74,7 @@ pub enum PrimitiveSchema {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
-#[expect(clippy::exhaustive_enums, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub enum StringFormat {
     /// Email address format
     Email,
@@ -346,7 +349,7 @@ impl NumberSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
-#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub struct IntegerSchema {
     /// Type discriminator
     #[serde(rename = "type")]
@@ -513,7 +516,7 @@ impl BooleanSchema {
 /// Represent single entry for titled item
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub struct ConstTitle {
     #[serde(rename = "const")]
     pub const_: String,
@@ -534,7 +537,7 @@ impl ConstTitle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub struct LegacyEnumSchema {
     #[serde(rename = "type")]
     pub type_: StringTypeConst,
@@ -546,6 +549,21 @@ pub struct LegacyEnumSchema {
     pub enum_: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enum_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+impl LegacyEnumSchema {
+    pub fn new(enum_values: Vec<String>) -> Self {
+        Self {
+            type_: StringTypeConst,
+            title: None,
+            description: None,
+            enum_: enum_values,
+            enum_names: None,
+            default: None,
+        }
+    }
 }
 
 /// Untitled single-select
@@ -601,7 +619,7 @@ impl TitledSingleSelectEnumSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
-#[expect(clippy::exhaustive_enums, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub enum SingleSelectEnumSchema {
     Untitled(UntitledSingleSelectEnumSchema),
     Titled(TitledSingleSelectEnumSchema),
@@ -610,7 +628,7 @@ pub enum SingleSelectEnumSchema {
 /// Items for untitled multi-select options
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub struct UntitledItems {
     #[serde(rename = "type")]
     pub type_: StringTypeConst,
@@ -618,10 +636,19 @@ pub struct UntitledItems {
     pub enum_: Vec<String>,
 }
 
+impl UntitledItems {
+    pub fn new(enum_values: Vec<String>) -> Self {
+        Self {
+            type_: StringTypeConst,
+            enum_: enum_values,
+        }
+    }
+}
+
 /// Items for titled multi-select options
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub struct TitledItems {
     // MCP spec requires "anyOf" for multi-select enums (allows any combination)
     // Alias "oneOf" for compatibility with schemars
@@ -727,7 +754,7 @@ impl TitledMultiSelectEnumSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
-#[expect(clippy::exhaustive_enums, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub enum MultiSelectEnumSchema {
     Untitled(UntitledMultiSelectEnumSchema),
     Titled(TitledMultiSelectEnumSchema),
@@ -751,7 +778,7 @@ pub enum MultiSelectEnumSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
-#[expect(clippy::exhaustive_enums, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub enum EnumSchema {
     Single(SingleSelectEnumSchema),
     Multi(MultiSelectEnumSchema),
@@ -1090,7 +1117,7 @@ impl EnumSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
-#[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
+#[non_exhaustive]
 pub struct ElicitationSchema {
     /// Always "object" for elicitation schemas
     #[serde(rename = "type")]
@@ -1101,7 +1128,7 @@ pub struct ElicitationSchema {
     pub title: Option<Cow<'static, str>>,
 
     /// Property definitions (must be primitive types)
-    pub properties: BTreeMap<String, PrimitiveSchema>,
+    pub properties: BTreeMap<String, PrimitiveSchemaDefinition>,
 
     /// List of required property names
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1114,7 +1141,7 @@ pub struct ElicitationSchema {
 
 impl ElicitationSchema {
     /// Create a new elicitation schema with the given properties
-    pub fn new(properties: BTreeMap<String, PrimitiveSchema>) -> Self {
+    pub fn new(properties: BTreeMap<String, PrimitiveSchemaDefinition>) -> Self {
         Self {
             type_: ObjectTypeConst,
             title: None,
@@ -1248,7 +1275,7 @@ impl ElicitationSchema {
 #[derive(Debug, Default)]
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct ElicitationSchemaBuilder {
-    pub properties: BTreeMap<String, PrimitiveSchema>,
+    pub properties: BTreeMap<String, PrimitiveSchemaDefinition>,
     pub required: Vec<String>,
     pub title: Option<Cow<'static, str>>,
     pub description: Option<Cow<'static, str>>,
@@ -1261,13 +1288,17 @@ impl ElicitationSchemaBuilder {
     }
 
     /// Add a property to the schema
-    pub fn property(mut self, name: impl Into<String>, schema: PrimitiveSchema) -> Self {
+    pub fn property(mut self, name: impl Into<String>, schema: PrimitiveSchemaDefinition) -> Self {
         self.properties.insert(name.into(), schema);
         self
     }
 
     /// Add a required property to the schema
-    pub fn required_property(mut self, name: impl Into<String>, schema: PrimitiveSchema) -> Self {
+    pub fn required_property(
+        mut self,
+        name: impl Into<String>,
+        schema: PrimitiveSchemaDefinition,
+    ) -> Self {
         let name_str = name.into();
         self.required.push(name_str.clone());
         self.properties.insert(name_str, schema);
@@ -1275,7 +1306,7 @@ impl ElicitationSchemaBuilder {
     }
 
     // ===========================================================================
-    // TYPED PROPERTY METHODS - Cleaner API without PrimitiveSchema wrapper
+    // TYPED PROPERTY METHODS - Cleaner API without PrimitiveSchemaDefinition wrapper
     // ===========================================================================
 
     /// Add a string property with custom builder (required)
@@ -1284,8 +1315,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(StringSchema) -> StringSchema,
     ) -> Self {
-        self.properties
-            .insert(name.into(), PrimitiveSchema::String(f(StringSchema::new())));
+        self.properties.insert(
+            name.into(),
+            PrimitiveSchemaDefinition::String(f(StringSchema::new())),
+        );
         self
     }
 
@@ -1297,8 +1330,10 @@ impl ElicitationSchemaBuilder {
     ) -> Self {
         let name_str = name.into();
         self.required.push(name_str.clone());
-        self.properties
-            .insert(name_str, PrimitiveSchema::String(f(StringSchema::new())));
+        self.properties.insert(
+            name_str,
+            PrimitiveSchemaDefinition::String(f(StringSchema::new())),
+        );
         self
     }
 
@@ -1308,8 +1343,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(NumberSchema) -> NumberSchema,
     ) -> Self {
-        self.properties
-            .insert(name.into(), PrimitiveSchema::Number(f(NumberSchema::new())));
+        self.properties.insert(
+            name.into(),
+            PrimitiveSchemaDefinition::Number(f(NumberSchema::new())),
+        );
         self
     }
 
@@ -1321,8 +1358,10 @@ impl ElicitationSchemaBuilder {
     ) -> Self {
         let name_str = name.into();
         self.required.push(name_str.clone());
-        self.properties
-            .insert(name_str, PrimitiveSchema::Number(f(NumberSchema::new())));
+        self.properties.insert(
+            name_str,
+            PrimitiveSchemaDefinition::Number(f(NumberSchema::new())),
+        );
         self
     }
 
@@ -1334,7 +1373,7 @@ impl ElicitationSchemaBuilder {
     ) -> Self {
         self.properties.insert(
             name.into(),
-            PrimitiveSchema::Integer(f(IntegerSchema::new())),
+            PrimitiveSchemaDefinition::Integer(f(IntegerSchema::new())),
         );
         self
     }
@@ -1347,8 +1386,10 @@ impl ElicitationSchemaBuilder {
     ) -> Self {
         let name_str = name.into();
         self.required.push(name_str.clone());
-        self.properties
-            .insert(name_str, PrimitiveSchema::Integer(f(IntegerSchema::new())));
+        self.properties.insert(
+            name_str,
+            PrimitiveSchemaDefinition::Integer(f(IntegerSchema::new())),
+        );
         self
     }
 
@@ -1360,7 +1401,7 @@ impl ElicitationSchemaBuilder {
     ) -> Self {
         self.properties.insert(
             name.into(),
-            PrimitiveSchema::Boolean(f(BooleanSchema::new())),
+            PrimitiveSchemaDefinition::Boolean(f(BooleanSchema::new())),
         );
         self
     }
@@ -1373,8 +1414,10 @@ impl ElicitationSchemaBuilder {
     ) -> Self {
         let name_str = name.into();
         self.required.push(name_str.clone());
-        self.properties
-            .insert(name_str, PrimitiveSchema::Boolean(f(BooleanSchema::new())));
+        self.properties.insert(
+            name_str,
+            PrimitiveSchemaDefinition::Boolean(f(BooleanSchema::new())),
+        );
         self
     }
 
@@ -1384,22 +1427,28 @@ impl ElicitationSchemaBuilder {
 
     /// Add a required string property
     pub fn required_string(self, name: impl Into<String>) -> Self {
-        self.required_property(name, PrimitiveSchema::String(StringSchema::new()))
+        self.required_property(name, PrimitiveSchemaDefinition::String(StringSchema::new()))
     }
 
     /// Add an optional string property
     pub fn optional_string(self, name: impl Into<String>) -> Self {
-        self.property(name, PrimitiveSchema::String(StringSchema::new()))
+        self.property(name, PrimitiveSchemaDefinition::String(StringSchema::new()))
     }
 
     /// Add a required email property
     pub fn required_email(self, name: impl Into<String>) -> Self {
-        self.required_property(name, PrimitiveSchema::String(StringSchema::email()))
+        self.required_property(
+            name,
+            PrimitiveSchemaDefinition::String(StringSchema::email()),
+        )
     }
 
     /// Add an optional email property
     pub fn optional_email(self, name: impl Into<String>) -> Self {
-        self.property(name, PrimitiveSchema::String(StringSchema::email()))
+        self.property(
+            name,
+            PrimitiveSchemaDefinition::String(StringSchema::email()),
+        )
     }
 
     /// Add a required string property with custom builder
@@ -1408,7 +1457,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(StringSchema) -> StringSchema,
     ) -> Self {
-        self.required_property(name, PrimitiveSchema::String(f(StringSchema::new())))
+        self.required_property(
+            name,
+            PrimitiveSchemaDefinition::String(f(StringSchema::new())),
+        )
     }
 
     /// Add an optional string property with custom builder
@@ -1417,7 +1469,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(StringSchema) -> StringSchema,
     ) -> Self {
-        self.property(name, PrimitiveSchema::String(f(StringSchema::new())))
+        self.property(
+            name,
+            PrimitiveSchemaDefinition::String(f(StringSchema::new())),
+        )
     }
 
     // Convenience methods for numbers
@@ -1426,7 +1481,7 @@ impl ElicitationSchemaBuilder {
     pub fn required_number(self, name: impl Into<String>, min: f64, max: f64) -> Self {
         self.required_property(
             name,
-            PrimitiveSchema::Number(NumberSchema::new().range(min, max)),
+            PrimitiveSchemaDefinition::Number(NumberSchema::new().range(min, max)),
         )
     }
 
@@ -1434,7 +1489,7 @@ impl ElicitationSchemaBuilder {
     pub fn optional_number(self, name: impl Into<String>, min: f64, max: f64) -> Self {
         self.property(
             name,
-            PrimitiveSchema::Number(NumberSchema::new().range(min, max)),
+            PrimitiveSchemaDefinition::Number(NumberSchema::new().range(min, max)),
         )
     }
 
@@ -1444,7 +1499,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(NumberSchema) -> NumberSchema,
     ) -> Self {
-        self.required_property(name, PrimitiveSchema::Number(f(NumberSchema::new())))
+        self.required_property(
+            name,
+            PrimitiveSchemaDefinition::Number(f(NumberSchema::new())),
+        )
     }
 
     /// Add an optional number property with custom builder
@@ -1453,7 +1511,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(NumberSchema) -> NumberSchema,
     ) -> Self {
-        self.property(name, PrimitiveSchema::Number(f(NumberSchema::new())))
+        self.property(
+            name,
+            PrimitiveSchemaDefinition::Number(f(NumberSchema::new())),
+        )
     }
 
     // Convenience methods for integers
@@ -1462,7 +1523,7 @@ impl ElicitationSchemaBuilder {
     pub fn required_integer(self, name: impl Into<String>, min: i64, max: i64) -> Self {
         self.required_property(
             name,
-            PrimitiveSchema::Integer(IntegerSchema::new().range(min, max)),
+            PrimitiveSchemaDefinition::Integer(IntegerSchema::new().range(min, max)),
         )
     }
 
@@ -1470,7 +1531,7 @@ impl ElicitationSchemaBuilder {
     pub fn optional_integer(self, name: impl Into<String>, min: i64, max: i64) -> Self {
         self.property(
             name,
-            PrimitiveSchema::Integer(IntegerSchema::new().range(min, max)),
+            PrimitiveSchemaDefinition::Integer(IntegerSchema::new().range(min, max)),
         )
     }
 
@@ -1480,7 +1541,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(IntegerSchema) -> IntegerSchema,
     ) -> Self {
-        self.required_property(name, PrimitiveSchema::Integer(f(IntegerSchema::new())))
+        self.required_property(
+            name,
+            PrimitiveSchemaDefinition::Integer(f(IntegerSchema::new())),
+        )
     }
 
     /// Add an optional integer property with custom builder
@@ -1489,21 +1553,27 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(IntegerSchema) -> IntegerSchema,
     ) -> Self {
-        self.property(name, PrimitiveSchema::Integer(f(IntegerSchema::new())))
+        self.property(
+            name,
+            PrimitiveSchemaDefinition::Integer(f(IntegerSchema::new())),
+        )
     }
 
     // Convenience methods for booleans
 
     /// Add a required boolean property
     pub fn required_bool(self, name: impl Into<String>) -> Self {
-        self.required_property(name, PrimitiveSchema::Boolean(BooleanSchema::new()))
+        self.required_property(
+            name,
+            PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+        )
     }
 
     /// Add an optional boolean property with default value
     pub fn optional_bool(self, name: impl Into<String>, default: bool) -> Self {
         self.property(
             name,
-            PrimitiveSchema::Boolean(BooleanSchema::new().with_default(default)),
+            PrimitiveSchemaDefinition::Boolean(BooleanSchema::new().with_default(default)),
         )
     }
 
@@ -1513,7 +1583,10 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(BooleanSchema) -> BooleanSchema,
     ) -> Self {
-        self.required_property(name, PrimitiveSchema::Boolean(f(BooleanSchema::new())))
+        self.required_property(
+            name,
+            PrimitiveSchemaDefinition::Boolean(f(BooleanSchema::new())),
+        )
     }
 
     /// Add an optional boolean property with custom builder
@@ -1522,19 +1595,22 @@ impl ElicitationSchemaBuilder {
         name: impl Into<String>,
         f: impl FnOnce(BooleanSchema) -> BooleanSchema,
     ) -> Self {
-        self.property(name, PrimitiveSchema::Boolean(f(BooleanSchema::new())))
+        self.property(
+            name,
+            PrimitiveSchemaDefinition::Boolean(f(BooleanSchema::new())),
+        )
     }
 
     // Enum convenience methods
 
     /// Add a required enum property using EnumSchema
     pub fn required_enum_schema(self, name: impl Into<String>, enum_schema: EnumSchema) -> Self {
-        self.required_property(name, PrimitiveSchema::Enum(enum_schema))
+        self.required_property(name, PrimitiveSchemaDefinition::Enum(enum_schema))
     }
 
     /// Add an optional enum property using EnumSchema
     pub fn optional_enum_schema(self, name: impl Into<String>, enum_schema: EnumSchema) -> Self {
-        self.property(name, PrimitiveSchema::Enum(enum_schema))
+        self.property(name, PrimitiveSchemaDefinition::Enum(enum_schema))
     }
 
     /// Add a required enum property using values. Creates an untitled single-select enum.
@@ -1545,12 +1621,13 @@ impl ElicitationSchemaBuilder {
     pub fn required_enum(self, name: impl Into<String>, values: Vec<String>) -> Self {
         self.required_property(
             name,
-            PrimitiveSchema::Enum(EnumSchema::Legacy(LegacyEnumSchema {
+            PrimitiveSchemaDefinition::Enum(EnumSchema::Legacy(LegacyEnumSchema {
                 type_: StringTypeConst,
                 title: None,
                 description: None,
                 enum_: values,
                 enum_names: None,
+                default: None,
             })),
         )
     }
@@ -1563,12 +1640,13 @@ impl ElicitationSchemaBuilder {
     pub fn optional_enum(self, name: impl Into<String>, values: Vec<String>) -> Self {
         self.property(
             name,
-            PrimitiveSchema::Enum(EnumSchema::Legacy(LegacyEnumSchema {
+            PrimitiveSchemaDefinition::Enum(EnumSchema::Legacy(LegacyEnumSchema {
                 type_: StringTypeConst,
                 title: None,
                 description: None,
                 enum_: values,
                 enum_names: None,
+                default: None,
             })),
         )
     }
@@ -1634,49 +1712,70 @@ impl ElicitationSchemaBuilder {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use rstest::rstest;
     use serde_json::json;
 
     use super::*;
 
-    #[test]
-    fn test_string_schema_serialization() {
-        let schema = StringSchema::email().description("Email address");
-        let json = serde_json::to_value(&schema).unwrap();
-
-        assert_eq!(json["type"], "string");
-        assert_eq!(json["format"], "email");
-        assert_eq!(json["description"], "Email address");
+    fn string_schema_json() -> serde_json::Value {
+        serde_json::to_value(StringSchema::email().description("Email address")).unwrap()
     }
 
-    #[test]
-    fn test_number_schema_serialization() {
-        let schema = NumberSchema::new()
-            .range(0.0, 100.0)
-            .description("Percentage");
-        let json = serde_json::to_value(&schema).unwrap();
-
-        assert_eq!(json["type"], "number");
-        assert_eq!(json["minimum"], 0.0);
-        assert_eq!(json["maximum"], 100.0);
+    fn number_schema_json() -> serde_json::Value {
+        serde_json::to_value(
+            NumberSchema::new()
+                .range(0.0, 100.0)
+                .description("Percentage"),
+        )
+        .unwrap()
     }
 
-    #[test]
-    fn test_integer_schema_serialization() {
-        let schema = IntegerSchema::new().range(0, 150);
-        let json = serde_json::to_value(&schema).unwrap();
-
-        assert_eq!(json["type"], "integer");
-        assert_eq!(json["minimum"], 0);
-        assert_eq!(json["maximum"], 150);
+    fn integer_schema_json() -> serde_json::Value {
+        serde_json::to_value(IntegerSchema::new().range(0, 150)).unwrap()
     }
 
-    #[test]
-    fn test_boolean_schema_serialization() {
-        let schema = BooleanSchema::new().with_default(true);
-        let json = serde_json::to_value(&schema).unwrap();
+    fn boolean_schema_json() -> serde_json::Value {
+        serde_json::to_value(BooleanSchema::new().with_default(true)).unwrap()
+    }
 
-        assert_eq!(json["type"], "boolean");
-        assert_eq!(json["default"], true);
+    #[rstest]
+    #[case::string_schema(
+        string_schema_json,
+        json!({
+            "type": "string",
+            "format": "email",
+            "description": "Email address",
+        })
+    )]
+    #[case::number_schema(
+        number_schema_json,
+        json!({
+            "type": "number",
+            "description": "Percentage",
+            "minimum": 0.0,
+            "maximum": 100.0,
+        })
+    )]
+    #[case::integer_schema(
+        integer_schema_json,
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 150,
+        })
+    )]
+    #[case::boolean_schema(
+        boolean_schema_json,
+        json!({
+            "type": "boolean",
+            "default": true,
+        })
+    )]
+    fn primitive_schema_serializes_to_expected_json(
+        #[case] schema_json: fn() -> serde_json::Value,
+        #[case] expected: serde_json::Value,
+    ) {
+        assert_eq!(schema_json(), expected);
     }
 
     #[test]
@@ -1743,6 +1842,7 @@ mod tests {
             description: Some("A legacy enum schema".into()),
             enum_: vec!["A".to_string(), "B".to_string()],
             enum_names: Some(vec!["Option A".to_string(), "Option B".to_string()]),
+            default: None,
         });
         let json = serde_json::to_value(&schema)?;
 
@@ -1787,6 +1887,7 @@ mod tests {
             description: None,
             enum_: vec!["a".to_string(), "b".to_string()],
             enum_names: None,
+            default: None,
         });
         let json = serde_json::to_value(&schema)?;
         assert!(!json.as_object().unwrap().contains_key("enumNames"));
@@ -1981,14 +2082,14 @@ mod tests {
             "type": "string",
             "enum": ["a", "b"]
         });
-        let schema: PrimitiveSchema = serde_json::from_value(json).unwrap();
-        assert!(matches!(schema, PrimitiveSchema::Enum(_)));
+        let schema: PrimitiveSchemaDefinition = serde_json::from_value(json).unwrap();
+        assert!(matches!(schema, PrimitiveSchemaDefinition::Enum(_)));
         // Test that string schemas deserialize as String variant
         let json = json!({
             "type": "string"
         });
-        let schema: PrimitiveSchema = serde_json::from_value(json).unwrap();
-        assert!(matches!(schema, PrimitiveSchema::String(_)));
+        let schema: PrimitiveSchemaDefinition = serde_json::from_value(json).unwrap();
+        assert!(matches!(schema, PrimitiveSchemaDefinition::String(_)));
     }
 
     #[test]

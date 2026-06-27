@@ -137,7 +137,7 @@ use crate::{
         tool::{CallToolHandler, DynCallToolHandler, ToolCallContext},
         tool_name_validation::validate_and_warn_tool_name,
     },
-    model::{CallToolResult, Content, ErrorCode, Tool, ToolAnnotations},
+    model::{CallToolResult, ContentBlock, ErrorCode, Tool, ToolAnnotations},
     service::{MaybeBoxFuture, MaybeSend},
 };
 
@@ -149,7 +149,9 @@ fn into_tool_argument_error(error: crate::ErrorData) -> Result<CallToolResult, c
             .message
             .starts_with(TOOL_ARGUMENT_DESERIALIZATION_ERROR_PREFIX)
     {
-        return Ok(CallToolResult::error(vec![Content::text(error.message)]));
+        return Ok(CallToolResult::error(vec![ContentBlock::text(
+            error.message,
+        )]));
     }
 
     Err(error)
@@ -691,7 +693,7 @@ mod tests {
         let text = result
             .content
             .first()
-            .and_then(|content| content.raw.as_text())
+            .and_then(|content| content.as_text())
             .map(|text| text.text.as_str())
             .expect("tool error result should include text");
         assert!(text.contains("failed to deserialize parameters"));
@@ -732,7 +734,7 @@ mod tests {
     #[cfg(feature = "anthropic-ext")]
     #[tokio::test]
     async fn router_call_strips_empty_structured_content() {
-        use crate::model::{Content, RawResource};
+        use crate::model::{ContentBlock, Resource};
 
         let service = DummyService;
         let router = ToolRouter::new().with_route(ToolRoute::new_dyn(
@@ -744,8 +746,8 @@ mod tests {
                     // content[]. Without normalization, Claude Code shadows
                     // the resource_link.
                     let mut result = CallToolResult::structured(serde_json::json!({}));
-                    let raw = RawResource::new("studio://download/uuid/x.png", "x.png");
-                    result.content.push(Content::resource_link(raw));
+                    let raw = Resource::new("studio://download/uuid/x.png", "x.png");
+                    result.content.push(ContentBlock::resource_link(raw));
                     Ok(result)
                 })
             },
@@ -775,7 +777,7 @@ mod tests {
             result
                 .content
                 .iter()
-                .any(|c| c.raw.as_resource_link().is_some()),
+                .any(|c| c.as_resource_link().is_some()),
             "resource_link must survive normalization on content[]"
         );
     }

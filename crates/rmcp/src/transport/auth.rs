@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,7 +17,7 @@ use oauth2::{
 };
 use reqwest::{
     Client as ReqwestClient, IntoUrl, StatusCode, Url,
-    header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+    header::{AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,6 +29,12 @@ use crate::transport::common::http_header::HEADER_MCP_PROTOCOL_VERSION;
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_OAUTH_DISCOVERY_REDIRECTS: usize = 10;
+const CLOUD_METADATA_HOSTS: &[&str] = &[
+    "metadata",
+    "metadata.google.internal",
+    "metadata.azure.internal",
+];
 
 /// Redirect handling requested for an outbound OAuth HTTP operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -821,6 +828,100 @@ fn is_https_url(value: &str) -> bool {
 }
 
 impl AuthorizationManager {
+    fn is_http_url(url: &Url) -> bool {
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+    }
+
+    fn is_same_origin(base: &Url, candidate: &Url) -> bool {
+        base.scheme() == candidate.scheme()
+            && base
+                .host_str()
+                .zip(candidate.host_str())
+                .is_some_and(|(base, candidate)| base.eq_ignore_ascii_case(candidate))
+            && base.port_or_known_default() == candidate.port_or_known_default()
+    }
+
+    fn is_same_origin_resource_metadata_url(base_url: &Url, candidate: &Url) -> bool {
+        Self::is_http_url(candidate) && Self::is_same_origin(base_url, candidate)
+    }
+
+    fn is_disallowed_metadata_ipv4(addr: Ipv4Addr) -> bool {
+        let octets = addr.octets();
+        addr.is_private()
+            || addr.is_loopback()
+            || addr.is_link_local()
+            || addr.is_broadcast()
+            || addr.is_unspecified()
+            || addr.is_multicast()
+            || octets[0] == 0
+            || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+            || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+    }
+
+    fn is_disallowed_metadata_ipv6(addr: Ipv6Addr) -> bool {
+        if let Some(mapped) = addr.to_ipv4_mapped() {
+            return Self::is_disallowed_metadata_ipv4(mapped);
+        }
+
+        let segments = addr.segments();
+        addr.is_loopback()
+            || addr.is_unspecified()
+            || addr.is_multicast()
+            || (segments[0] & 0xffc0) == 0xfe80
+            || (segments[0] & 0xfe00) == 0xfc00
+    }
+
+    fn is_disallowed_metadata_hostname(host: &str) -> bool {
+        matches!(host, "localhost")
+            || host.ends_with(".localhost")
+            || CLOUD_METADATA_HOSTS.contains(&host)
+    }
+
+    fn is_disallowed_metadata_host(host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if Self::is_disallowed_metadata_hostname(&host) {
+            return true;
+        }
+
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(addr)) => Self::is_disallowed_metadata_ipv4(addr),
+            Ok(IpAddr::V6(addr)) => Self::is_disallowed_metadata_ipv6(addr),
+            Err(_) => false,
+        }
+    }
+
+    fn is_allowed_authorization_server_metadata_url(url: &Url) -> bool {
+        Self::is_http_url(url)
+            && url
+                .host_str()
+                .is_some_and(|host| !Self::is_disallowed_metadata_host(host))
+    }
+
+    fn resolve_resource_metadata_url(value: &str, base_url: &Url) -> Option<Url> {
+        let value = value.trim();
+        if value.is_empty() {
+            debug!("ignoring empty resource_metadata value");
+            return None;
+        }
+
+        let url = match Url::parse(value).or_else(|_| base_url.join(value)) {
+            Ok(url) => url,
+            Err(error) => {
+                debug!("failed to parse resource metadata value `{value}` as URL: {error}");
+                return None;
+            }
+        };
+
+        if Self::is_same_origin_resource_metadata_url(base_url, &url) {
+            Some(url)
+        } else {
+            warn!(
+                "rejecting resource metadata URL `{url}` because it is not same-origin with `{base_url}`"
+            );
+            None
+        }
+    }
+
     fn well_known_paths(base_path: &str, resource: &str) -> Vec<String> {
         let trimmed = base_path.trim_start_matches('/').trim_end_matches('/');
         let mut candidates = Vec::new();
@@ -1771,6 +1872,11 @@ impl AuthorizationManager {
                 },
             };
 
+            if !Self::is_allowed_authorization_server_metadata_url(&candidate_url) {
+                warn!("rejecting authorization server metadata URL `{candidate_url}`");
+                continue;
+            }
+
             if candidate_url.path().contains("/.well-known/") {
                 if let Some(metadata) = self.fetch_authorization_metadata(&candidate_url).await? {
                     return Ok(Some(metadata));
@@ -1889,18 +1995,49 @@ impl AuthorizationManager {
     }
 
     async fn discovery_get(&self, url: &Url) -> Result<HttpResponse, OAuthHttpClientError> {
-        let request = oauth2::http::Request::builder()
-            .method("GET")
-            .uri(url.as_str())
-            .header(HEADER_MCP_PROTOCOL_VERSION, "2024-11-05")
-            .body(Vec::new())
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
-        self.http_client
-            .execute(OAuthHttpRequest::new(
-                request,
-                OAuthHttpRedirectPolicy::Follow,
-            ))
-            .await
+        let mut current_url = url.clone();
+        for _ in 0..MAX_OAUTH_DISCOVERY_REDIRECTS {
+            let request = oauth2::http::Request::builder()
+                .method("GET")
+                .uri(current_url.as_str())
+                .header(HEADER_MCP_PROTOCOL_VERSION, "2024-11-05")
+                .body(Vec::new())
+                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            let response = self
+                .http_client
+                .execute(OAuthHttpRequest::new(
+                    request,
+                    OAuthHttpRedirectPolicy::Stop,
+                ))
+                .await?;
+
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+
+            let Some(location) = response.headers().get(LOCATION) else {
+                return Ok(response);
+            };
+            let location = location
+                .to_str()
+                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            let next_url = current_url
+                .join(location)
+                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+
+            if Self::is_http_url(&next_url) && Self::is_same_origin(&current_url, &next_url) {
+                current_url = next_url;
+                continue;
+            }
+
+            return Err(OAuthHttpClientError::new(format!(
+                "OAuth discovery redirect to non-same-origin URL rejected: {next_url}"
+            )));
+        }
+
+        Err(OAuthHttpClientError::new(format!(
+            "OAuth discovery exceeded {MAX_OAUTH_DISCOVERY_REDIRECTS} redirects"
+        )))
     }
 
     /// extract parameters from WWW-Authenticate header (resource_metadata and scope)
@@ -1915,15 +2052,10 @@ impl AuthorizationManager {
             let global_pos = search_offset + pos + resource_key.len();
             let value_slice = &header[global_pos..];
             if let Some((value, consumed)) = Self::parse_next_header_value(value_slice) {
-                if let Ok(url) = Url::parse(&value) {
+                if let Some(url) = Self::resolve_resource_metadata_url(&value, base_url) {
                     params.resource_metadata_url = Some(url);
                     break;
                 }
-                if let Ok(url) = base_url.join(&value) {
-                    params.resource_metadata_url = Some(url);
-                    break;
-                }
-                debug!("failed to parse resource metadata value `{value}` as URL");
                 search_offset = global_pos + consumed;
                 continue;
             } else {
@@ -2975,6 +3107,7 @@ mod tests {
     };
 
     use oauth2::{AuthType, CsrfToken, HttpResponse, PkceCodeVerifier};
+    use rstest::rstest;
     use url::Url;
 
     use super::{
@@ -3034,6 +3167,14 @@ mod tests {
             .unwrap()
     }
 
+    fn redirect_response(location: &str) -> HttpResponse {
+        oauth2::http::Response::builder()
+            .status(302)
+            .header("location", location)
+            .body(Vec::new())
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn custom_http_client_handles_protected_resource_discovery() {
         let challenge = oauth2::http::Response::builder()
@@ -3076,23 +3217,144 @@ mod tests {
                 RecordedOAuthRequest {
                     method: "GET".to_string(),
                     uri: "https://mcp.example.com/mcp".to_string(),
-                    redirect_policy: OAuthHttpRedirectPolicy::Follow,
+                    redirect_policy: OAuthHttpRedirectPolicy::Stop,
                     body: Vec::new(),
                 },
                 RecordedOAuthRequest {
                     method: "GET".to_string(),
                     uri: "https://mcp.example.com/.well-known/oauth-protected-resource".to_string(),
-                    redirect_policy: OAuthHttpRedirectPolicy::Follow,
+                    redirect_policy: OAuthHttpRedirectPolicy::Stop,
                     body: Vec::new(),
                 },
                 RecordedOAuthRequest {
                     method: "GET".to_string(),
                     uri: "https://auth.example.com/.well-known/oauth-authorization-server"
                         .to_string(),
-                    redirect_policy: OAuthHttpRedirectPolicy::Follow,
+                    redirect_policy: OAuthHttpRedirectPolicy::Stop,
                     body: Vec::new(),
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_get_follows_same_origin_redirects() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            redirect_response("/redirected"),
+            http_response(200, serde_json::json!({})),
+        ]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let response = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/start").unwrap())
+            .await
+            .unwrap();
+        let requests = client.requests();
+
+        assert_eq!(
+            (
+                response.status(),
+                requests
+                    .iter()
+                    .map(|request| request.uri.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            (
+                oauth2::http::StatusCode::OK,
+                vec![
+                    "https://mcp.example.com/start",
+                    "https://mcp.example.com/redirected"
+                ]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_get_rejects_cross_origin_redirects() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![redirect_response(
+            "http://169.254.169.254/",
+        )]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let err = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/start").unwrap())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            (
+                err.to_string().contains("non-same-origin"),
+                client.requests().len()
+            ),
+            (true, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_rejects_private_authorization_server_urls() {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            challenge,
+            http_response(
+                200,
+                serde_json::json!({
+                    "authorization_servers": [
+                        "http://169.254.169.254/latest/meta-data/",
+                        "https://auth.example.com"
+                    ]
+                }),
+            ),
+            http_response(
+                200,
+                serde_json::json!({
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token"
+                }),
+            ),
+        ]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let metadata = manager.discover_metadata().await.unwrap();
+        let requests = client.requests();
+
+        assert_eq!(
+            (
+                metadata.token_endpoint.as_str(),
+                requests
+                    .iter()
+                    .map(|request| request.uri.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "https://auth.example.com/token",
+                vec![
+                    "https://mcp.example.com/mcp",
+                    "https://mcp.example.com/.well-known/oauth-protected-resource",
+                    "https://auth.example.com/.well-known/oauth-authorization-server"
+                ]
+            )
         );
     }
 
@@ -3348,44 +3610,35 @@ mod tests {
 
     // -- header value parsing --
 
-    #[test]
-    fn parse_auth_param_value_handles_quoted_string() {
-        let fragment = r#""example", realm="foo""#;
-        let parsed = AuthorizationManager::parse_next_header_value(fragment).unwrap();
-        assert_eq!(parsed.0, "example");
-        assert_eq!(parsed.1, 9);
-    }
+    #[rstest]
+    #[case::quoted_string(r#""example", realm="foo""#, "example", r#""example""#)]
+    #[case::escaped_quotes_and_whitespace(
+        r#"   "a\"b\\c" ,next=value"#,
+        r#"a"b\c"#,
+        r#"   "a\"b\\c""#
+    )]
+    #[case::token_values("  token,next", "token", "  token")]
+    #[case::semicolon_separated_tokens(
+        r#"  https://example.com/meta; error="invalid_token""#,
+        "https://example.com/meta",
+        "  https://example.com/meta"
+    )]
+    #[case::semicolon_after_quoted_value(
+        r#"  "https://example.com/meta"; error="invalid_token""#,
+        "https://example.com/meta",
+        r#"  "https://example.com/meta""#
+    )]
+    fn parse_auth_param_value_handles_supported_values(
+        #[case] fragment: &str,
+        #[case] expected_value: &str,
+        #[case] expected_consumed_prefix: &str,
+    ) {
+        let (value, consumed) = AuthorizationManager::parse_next_header_value(fragment).unwrap();
 
-    #[test]
-    fn parse_auth_param_value_handles_escaped_quotes_and_whitespace() {
-        let fragment = r#"   "a\"b\\c" ,next=value"#;
-        let parsed = AuthorizationManager::parse_next_header_value(fragment).unwrap();
-        assert_eq!(parsed.0, r#"a"b\c"#);
-        assert_eq!(parsed.1, 12);
-    }
-
-    #[test]
-    fn parse_auth_param_value_handles_token_values() {
-        let fragment = "  token,next";
-        let parsed = AuthorizationManager::parse_next_header_value(fragment).unwrap();
-        assert_eq!(parsed.0, "token");
-        assert_eq!(parsed.1, 7);
-    }
-
-    #[test]
-    fn parse_auth_param_value_handles_semicolon_separated_tokens() {
-        let fragment = r#"  https://example.com/meta; error="invalid_token""#;
-        let parsed = AuthorizationManager::parse_next_header_value(fragment).unwrap();
-        assert_eq!(parsed.0, "https://example.com/meta");
-        assert_eq!(&fragment[..parsed.1], "  https://example.com/meta");
-    }
-
-    #[test]
-    fn parse_auth_param_value_handles_semicolon_after_quoted_value() {
-        let fragment = r#"  "https://example.com/meta"; error="invalid_token""#;
-        let parsed = AuthorizationManager::parse_next_header_value(fragment).unwrap();
-        assert_eq!(parsed.0, "https://example.com/meta");
-        assert_eq!(&fragment[..parsed.1], r#"  "https://example.com/meta""#);
+        assert_eq!(
+            (value.as_str(), &fragment[..consumed]),
+            (expected_value, expected_consumed_prefix)
+        );
     }
 
     #[test]
@@ -3416,6 +3669,25 @@ mod tests {
             params.resource_metadata_url.unwrap().as_str(),
             "https://example.com/.well-known/oauth-protected-resource/api"
         );
+    }
+
+    #[test]
+    fn rejects_cross_origin_resource_metadata_parameter() {
+        let header = r#"Bearer error="invalid_request", resource_metadata="http://169.254.169.254/latest/meta-data/", scope="read""#;
+        let base = Url::parse("https://example.com/api").unwrap();
+        let params = AuthorizationManager::extract_www_authenticate_params(header, &base);
+
+        assert!(params.resource_metadata_url.is_none());
+        assert_eq!(params.scope.unwrap(), "read");
+    }
+
+    #[test]
+    fn rejects_non_http_resource_metadata_parameter() {
+        let header = r#"Bearer resource_metadata="file:///etc/passwd""#;
+        let base = Url::parse("https://example.com/api").unwrap();
+        let params = AuthorizationManager::extract_www_authenticate_params(header, &base);
+
+        assert!(params.resource_metadata_url.is_none());
     }
 
     #[test]
@@ -4010,104 +4282,113 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn validate_authorization_response_issuer_accepts_match_and_missing_issuer() {
+    #[rstest]
+    #[case::matching_issuer(
+        Some("https://auth.example.com"),
+        false,
+        Some("https://auth.example.com")
+    )]
+    #[case::missing_issuer_when_not_required(Some("https://auth.example.com"), false, None)]
+    fn validate_authorization_response_issuer_accepts_valid_cases(
+        #[case] expected_issuer: Option<&str>,
+        #[case] require_issuer: bool,
+        #[case] received_issuer: Option<&str>,
+    ) {
         let pkce = PkceCodeVerifier::new("verifier".to_string());
         let csrf = CsrfToken::new("csrf".to_string());
         let state = StoredAuthorizationState::new_with_expected_issuer(
             &pkce,
             &csrf,
-            Some("https://auth.example.com".to_string()),
-            false,
+            expected_issuer.map(str::to_owned),
+            require_issuer,
         );
 
         assert!(
-            AuthorizationManager::validate_authorization_response_issuer(
-                &state,
-                Some("https://auth.example.com")
-            )
-            .is_ok()
-        );
-        assert!(AuthorizationManager::validate_authorization_response_issuer(&state, None).is_ok());
-    }
-
-    #[test]
-    fn validate_authorization_response_issuer_requires_issuer_when_advertised() {
-        let pkce = PkceCodeVerifier::new("verifier".to_string());
-        let csrf = CsrfToken::new("csrf".to_string());
-        let state = StoredAuthorizationState::new_with_expected_issuer(
-            &pkce,
-            &csrf,
-            Some("https://auth.example.com".to_string()),
-            true,
-        );
-
-        let error =
-            AuthorizationManager::validate_authorization_response_issuer(&state, None).unwrap_err();
-
-        assert!(matches!(
-            error,
-            AuthError::AuthorizationServerMissingIssuer { expected_issuer }
-                if expected_issuer == "https://auth.example.com"
-        ));
-    }
-
-    #[test]
-    fn validate_authorization_response_issuer_rejects_present_issuer_without_expected_issuer() {
-        let pkce = PkceCodeVerifier::new("verifier".to_string());
-        let csrf = CsrfToken::new("csrf".to_string());
-        let state = StoredAuthorizationState::new_with_expected_issuer(&pkce, &csrf, None, false);
-
-        let error = AuthorizationManager::validate_authorization_response_issuer(
-            &state,
-            Some("https://auth.example.com"),
-        )
-        .unwrap_err();
-
-        assert!(
-            matches!(error, AuthError::AuthorizationFailed(message) if message.contains("expected issuer was not recorded"))
+            AuthorizationManager::validate_authorization_response_issuer(&state, received_issuer)
+                .is_ok()
         );
     }
 
-    #[test]
-    fn validate_authorization_response_issuer_rejects_required_issuer_without_expected_issuer() {
-        let pkce = PkceCodeVerifier::new("verifier".to_string());
-        let csrf = CsrfToken::new("csrf".to_string());
-        let state = StoredAuthorizationState::new_with_expected_issuer(&pkce, &csrf, None, true);
-
-        let error =
-            AuthorizationManager::validate_authorization_response_issuer(&state, None).unwrap_err();
-
-        assert!(
-            matches!(error, AuthError::AuthorizationFailed(message) if message.contains("expected issuer was not recorded"))
-        );
+    #[derive(Clone, Copy, Debug)]
+    enum ExpectedIssuerError {
+        Missing {
+            expected_issuer: &'static str,
+        },
+        NotRecorded,
+        Mismatch {
+            expected_issuer: &'static str,
+            received_issuer: &'static str,
+        },
     }
 
-    #[test]
-    fn validate_authorization_response_issuer_rejects_mismatch() {
-        let pkce = PkceCodeVerifier::new("verifier".to_string());
-        let csrf = CsrfToken::new("csrf".to_string());
-        let state = StoredAuthorizationState::new_with_expected_issuer(
-            &pkce,
-            &csrf,
-            Some("https://auth.example.com".to_string()),
-            false,
-        );
-
-        let error = AuthorizationManager::validate_authorization_response_issuer(
-            &state,
-            Some("https://evil.example.com"),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            AuthError::AuthorizationServerMismatch {
+    fn assert_expected_issuer_error(error: AuthError, expected: ExpectedIssuerError) {
+        match expected {
+            ExpectedIssuerError::Missing { expected_issuer } => assert!(matches!(
+                error,
+                AuthError::AuthorizationServerMissingIssuer { expected_issuer: actual }
+                    if actual == expected_issuer
+            )),
+            ExpectedIssuerError::NotRecorded => assert!(
+                matches!(error, AuthError::AuthorizationFailed(message) if message.contains("expected issuer was not recorded"))
+            ),
+            ExpectedIssuerError::Mismatch {
                 expected_issuer,
-                received_issuer
-            } if expected_issuer == "https://auth.example.com"
-                && received_issuer == "https://evil.example.com"
-        ));
+                received_issuer,
+            } => assert!(matches!(
+                error,
+                AuthError::AuthorizationServerMismatch {
+                    expected_issuer: actual_expected,
+                    received_issuer: actual_received
+                } if actual_expected == expected_issuer && actual_received == received_issuer
+            )),
+        }
+    }
+
+    #[rstest]
+    #[case::requires_advertised_issuer(
+        Some("https://auth.example.com"),
+        true,
+        None,
+        ExpectedIssuerError::Missing {
+            expected_issuer: "https://auth.example.com",
+        }
+    )]
+    #[case::present_issuer_without_expected(
+        None,
+        false,
+        Some("https://auth.example.com"),
+        ExpectedIssuerError::NotRecorded
+    )]
+    #[case::required_issuer_without_expected(None, true, None, ExpectedIssuerError::NotRecorded)]
+    #[case::mismatched_issuer(
+        Some("https://auth.example.com"),
+        false,
+        Some("https://evil.example.com"),
+        ExpectedIssuerError::Mismatch {
+            expected_issuer: "https://auth.example.com",
+            received_issuer: "https://evil.example.com",
+        }
+    )]
+    fn validate_authorization_response_issuer_rejects_invalid_cases(
+        #[case] expected_issuer: Option<&str>,
+        #[case] require_issuer: bool,
+        #[case] received_issuer: Option<&str>,
+        #[case] expected_error: ExpectedIssuerError,
+    ) {
+        let pkce = PkceCodeVerifier::new("verifier".to_string());
+        let csrf = CsrfToken::new("csrf".to_string());
+        let state = StoredAuthorizationState::new_with_expected_issuer(
+            &pkce,
+            &csrf,
+            expected_issuer.map(str::to_owned),
+            require_issuer,
+        );
+
+        let error =
+            AuthorizationManager::validate_authorization_response_issuer(&state, received_issuer)
+                .unwrap_err();
+
+        assert_expected_issuer_error(error, expected_error);
     }
 
     #[tokio::test]
@@ -4642,62 +4923,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn validate_client_credentials_metadata_accepts_supported_method() {
+    fn client_secret_credentials_config() -> super::ClientCredentialsConfig {
+        super::ClientCredentialsConfig::ClientSecret {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            scopes: vec![],
+            resource: None,
+        }
+    }
+
+    fn metadata_with_auth_methods(methods: serde_json::Value) -> AuthorizationMetadata {
         let mut additional_fields = HashMap::new();
-        additional_fields.insert(
-            "token_endpoint_auth_methods_supported".to_string(),
-            serde_json::json!(["client_secret_post", "client_secret_basic"]),
-        );
-        let meta = AuthorizationMetadata {
+        additional_fields.insert("token_endpoint_auth_methods_supported".to_string(), methods);
+        AuthorizationMetadata {
             authorization_endpoint: "http://localhost/authorize".to_string(),
             token_endpoint: "http://localhost/token".to_string(),
             additional_fields,
             ..Default::default()
-        };
-        let mgr = manager_with_metadata(Some(meta)).await;
-        let config = super::ClientCredentialsConfig::ClientSecret {
-            client_id: "id".to_string(),
-            client_secret: "secret".to_string(),
-            scopes: vec![],
-            resource: None,
-        };
-        mgr.validate_client_credentials_metadata(&config).unwrap();
+        }
     }
 
+    #[rstest]
+    #[case::supported_methods(Some(serde_json::json!([
+        "client_secret_post",
+        "client_secret_basic"
+    ])))]
+    #[case::field_absent(None)]
+    #[case::client_secret_basic_only(Some(serde_json::json!(["client_secret_basic"])))]
     #[tokio::test]
-    async fn validate_client_credentials_metadata_permits_when_field_absent() {
-        let mgr = manager_with_metadata(None).await;
-        let config = super::ClientCredentialsConfig::ClientSecret {
-            client_id: "id".to_string(),
-            client_secret: "secret".to_string(),
-            scopes: vec![],
-            resource: None,
-        };
-        mgr.validate_client_credentials_metadata(&config).unwrap();
-    }
+    async fn validate_client_credentials_metadata_accepts_supported_configurations(
+        #[case] auth_methods: Option<serde_json::Value>,
+    ) {
+        let mgr = manager_with_metadata(auth_methods.map(metadata_with_auth_methods)).await;
+        let config = client_secret_credentials_config();
 
-    #[tokio::test]
-    async fn validate_client_credentials_metadata_accepts_client_secret_basic_only() {
-        let mut additional_fields = HashMap::new();
-        additional_fields.insert(
-            "token_endpoint_auth_methods_supported".to_string(),
-            serde_json::json!(["client_secret_basic"]),
-        );
-        let meta = AuthorizationMetadata {
-            authorization_endpoint: "http://localhost/authorize".to_string(),
-            token_endpoint: "http://localhost/token".to_string(),
-            additional_fields,
-            ..Default::default()
-        };
-        let mgr = manager_with_metadata(Some(meta)).await;
-        let config = super::ClientCredentialsConfig::ClientSecret {
-            client_id: "id".to_string(),
-            client_secret: "secret".to_string(),
-            scopes: vec![],
-            resource: None,
-        };
-        // A server advertising only client_secret_basic must be accepted.
         mgr.validate_client_credentials_metadata(&config).unwrap();
     }
 

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{
     handler::server::tool::IntoCallToolResult,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
 };
 
 /// Json wrapper for structured output
@@ -42,7 +42,7 @@ impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for Json<T> {
     }
 }
 
-/// Typed structured response with extra `Content` blocks.
+/// Typed structured response with extra `ContentBlock` blocks.
 ///
 /// Returned by tools that emit a `resource_link` / `image` / inline
 /// resource alongside their structured response. The serialized JSON of
@@ -64,7 +64,7 @@ impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for Json<T> {
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct JsonAndArtifact<T> {
     pub value: T,
-    pub extras: Vec<Content>,
+    pub extras: Vec<ContentBlock>,
 }
 
 // JsonSchema delegates to T so the macro picks up the inner type's schema.
@@ -100,7 +100,7 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
-    use crate::model::RawResource;
+    use crate::model::Resource;
 
     #[derive(Serialize, JsonSchema)]
     struct DummyResp {
@@ -134,8 +134,8 @@ mod tests {
     #[test]
     fn json_and_artifact_with_resource_link_appends_to_content() {
         let value = DummyResp { count: 3 };
-        let raw = RawResource::new("studio://download/uuid/file.png", "file.png");
-        let link = Content::resource_link(raw);
+        let raw = Resource::new("studio://download/uuid/file.png", "file.png");
+        let link = ContentBlock::resource_link(raw);
         let result = JsonAndArtifact {
             value,
             extras: vec![link],
@@ -146,7 +146,7 @@ mod tests {
         assert!(result.structured_content.is_some());
         assert_eq!(result.content.len(), 2, "JSON dump + resource_link");
         assert!(
-            result.content[1].raw.as_resource_link().is_some(),
+            result.content[1].as_resource_link().is_some(),
             "second block is a resource_link"
         );
     }
@@ -155,14 +155,17 @@ mod tests {
     #[test]
     fn json_and_artifact_preserves_extras_order() {
         let value = DummyResp { count: 1 };
-        let raw = RawResource::new("studio://download/uuid/a.png", "a.png");
-        let extras = vec![Content::resource_link(raw), Content::text("summary")];
+        let raw = Resource::new("studio://download/uuid/a.png", "a.png");
+        let extras = vec![
+            ContentBlock::resource_link(raw),
+            ContentBlock::text("summary"),
+        ];
         let result = JsonAndArtifact { value, extras }
             .into_call_tool_result()
             .unwrap();
 
         assert_eq!(result.content.len(), 3);
-        assert!(result.content[1].raw.as_resource_link().is_some());
+        assert!(result.content[1].as_resource_link().is_some());
         assert_eq!(result.content[2].as_text().unwrap().text, "summary");
     }
 
