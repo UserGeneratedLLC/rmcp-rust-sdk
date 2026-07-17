@@ -40,7 +40,6 @@ schemars = { version = "1.2", optional = true }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-tungstenite = "0.30.0"
-reqwest = { version = "0.13.4" }
 pin-project-lite = "0.2"
 
 [[example]]
