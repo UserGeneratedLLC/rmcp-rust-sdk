@@ -137,21 +137,19 @@ use crate::{
         tool::{CallToolHandler, DynCallToolHandler, ToolCallContext},
         tool_name_validation::validate_and_warn_tool_name,
     },
-    model::{CallToolResult, ContentBlock, ErrorCode, Tool, ToolAnnotations},
+    model::{CallToolResponse, CallToolResult, ContentBlock, ErrorCode, Tool, ToolAnnotations},
     service::{MaybeBoxFuture, MaybeSend},
 };
 
 const TOOL_ARGUMENT_DESERIALIZATION_ERROR_PREFIX: &str = "failed to deserialize parameters:";
 
-fn into_tool_argument_error(error: crate::ErrorData) -> Result<CallToolResult, crate::ErrorData> {
+fn into_tool_argument_error(error: crate::ErrorData) -> Result<CallToolResponse, crate::ErrorData> {
     if error.code == ErrorCode::INVALID_PARAMS
         && error
             .message
             .starts_with(TOOL_ARGUMENT_DESERIALIZATION_ERROR_PREFIX)
     {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(
-            error.message,
-        )]));
+        return Ok(CallToolResult::error(vec![ContentBlock::text(error.message)]).into());
     }
 
     Err(error)
@@ -200,7 +198,8 @@ impl<S: MaybeSend + 'static> ToolRoute<S> {
     where
         C: for<'a> Fn(
                 ToolCallContext<'a, S>,
-            ) -> MaybeBoxFuture<'a, Result<CallToolResult, crate::ErrorData>>
+            )
+                -> MaybeBoxFuture<'a, Result<CallToolResponse, crate::ErrorData>>
             + MaybeSend
             + 'static,
     {
@@ -561,7 +560,7 @@ where
     pub async fn call(
         &self,
         context: ToolCallContext<'_, S>,
-    ) -> Result<CallToolResult, crate::ErrorData> {
+    ) -> Result<crate::model::CallToolResponse, crate::ErrorData> {
         let name = context.name();
         if self.disabled.contains(name) {
             return Err(crate::ErrorData::invalid_params("tool not found", None));
@@ -583,9 +582,13 @@ where
         // Strip empty `structuredContent: {}` so Claude Code surfaces
         // `content[]` extras (resource_link / image / summary text). See
         // `anthropic_ext::normalize_call_tool_result` for the rationale and
-        // claude-code#41361 for the related rendering bug.
+        // claude-code#41361 for the related rendering bug. Only the completed
+        // branch carries a `CallToolResult`; MRTR `InputRequired` results have
+        // no `structuredContent` to normalize.
         #[cfg(feature = "anthropic-ext")]
-        crate::anthropic_ext::normalize_call_tool_result(&mut result);
+        if let crate::model::CallToolResponse::Complete(result) = &mut result {
+            crate::anthropic_ext::normalize_call_tool_result(result);
+        }
 
         Ok(result)
     }
@@ -680,6 +683,8 @@ mod tests {
                 name: Cow::Borrowed("requires_params"),
                 arguments: Some(Default::default()),
                 task: None,
+                input_responses: None,
+                request_state: None,
             },
             RequestContext::new(NumberOrString::Number(1), peer),
         );
@@ -688,6 +693,9 @@ mod tests {
             .call(ctx)
             .await
             .expect("argument validation should be a tool result");
+        let CallToolResponse::Complete(result) = result else {
+            panic!("expected complete CallToolResult");
+        };
         assert_eq!(result.is_error, Some(true));
 
         let text = result
@@ -705,7 +713,7 @@ mod tests {
         let service = DummyService;
         let mut router = ToolRouter::new().with_route(ToolRoute::new_dyn(
             crate::model::Tool::new("test_tool", "a test tool", Arc::new(Default::default())),
-            |_ctx| Box::pin(async { Ok(CallToolResult::default()) }),
+            |_ctx| Box::pin(async { Ok(CallToolResult::default().into()) }),
         ));
         router.disable_route("test_tool");
 
@@ -719,6 +727,8 @@ mod tests {
                 name: Cow::Borrowed("test_tool"),
                 arguments: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             },
             RequestContext::new(NumberOrString::Number(1), peer),
         );
@@ -748,7 +758,7 @@ mod tests {
                     let mut result = CallToolResult::structured(serde_json::json!({}));
                     let raw = Resource::new("studio://download/uuid/x.png", "x.png");
                     result.content.push(ContentBlock::resource_link(raw));
-                    Ok(result)
+                    Ok(result.into())
                 })
             },
         ));
@@ -759,15 +769,16 @@ mod tests {
         let ctx = crate::handler::server::tool::ToolCallContext::new(
             &service,
             CallToolRequestParams {
-                meta: None,
                 name: Cow::Borrowed("empty_struct_tool"),
-                arguments: None,
-                task: None,
+                ..Default::default()
             },
             RequestContext::new(NumberOrString::Number(1), peer),
         );
 
-        let result = router.call(ctx).await.expect("call succeeds");
+        let CallToolResponse::Complete(result) = router.call(ctx).await.expect("call succeeds")
+        else {
+            panic!("expected complete CallToolResult");
+        };
         assert!(
             result.structured_content.is_none(),
             "router must strip empty `{{}}` structuredContent post-dispatch \

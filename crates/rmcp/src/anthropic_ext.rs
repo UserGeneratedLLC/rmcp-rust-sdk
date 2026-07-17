@@ -476,7 +476,16 @@ where
     T: serde::Serialize + schemars::JsonSchema + 'static,
 {
     let summary = text_summary(&value);
-    let mut result = Json(value).into_call_tool_result()?;
+    // `Json<T>` always resolves to the `Complete` variant; the MRTR
+    // `InputRequired` path is unreachable here.
+    let crate::model::CallToolResponse::Complete(mut result) =
+        Json(value).into_call_tool_result()?
+    else {
+        return Err(crate::ErrorData::internal_error(
+            "Json<T> unexpectedly produced an input-required result",
+            None,
+        ));
+    };
     result.content.push(ContentBlock::text(summary));
     Ok(result)
 }

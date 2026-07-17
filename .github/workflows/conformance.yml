@@ -14,6 +14,7 @@ concurrency:
 env:
   # Pinned for reproducible runs; bump deliberately when the suite updates.
   CONFORMANCE_VERSION: "0.1.16"
+  DRAFT_CONFORMANCE_VERSION: "0.2.0-alpha.9"
 
 jobs:
   server:
@@ -29,12 +30,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Build the whole package (server + client bins): the conformance crate is
-      # excluded from the workspace default-members, so this is the only CI job
-      # that catches compile breakage in it.
+      # excluded from the workspace default-members.
       - name: Build conformance binaries
         run: cargo build -p mcp-conformance
 
-      - name: Start conformance server
+      - name: Test conformance server
+        run: cargo test -p mcp-conformance --bin conformance-server
+
+      - name: Start 2025-11-25 server
         run: |
           PORT=8001 ./target/debug/conformance-server &
           echo $! > server.pid
@@ -47,7 +50,7 @@ jobs:
           echo "conformance server did not become ready" >&2
           exit 1
 
-      - name: Run server conformance suite
+      - name: Run 2025-11-25 server suite
         run: |
           npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
             --url http://127.0.0.1:8001/mcp \
@@ -56,7 +59,7 @@ jobs:
 
       # These pass today but are excluded from the default "active" suite;
       # run them explicitly so regressions are still caught.
-      - name: Run pending scenarios
+      - name: Run 2025-11-25 pending scenarios
         run: |
           for scenario in json-schema-2020-12 server-sse-polling; do
             npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
@@ -65,9 +68,125 @@ jobs:
               -o conformance-results
           done
 
-      - name: Stop conformance server
+      - name: Start draft server
+        run: |
+          STATELESS=1 PORT=8002 ./target/debug/conformance-server &
+          echo $! > draft-server.pid
+          for _ in $(seq 1 30); do
+            if curl -s -o /dev/null http://127.0.0.1:8002/mcp; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "draft conformance server did not become ready" >&2
+          exit 1
+
+      # Run discovery separately until #985 enables the full draft suite.
+      - name: Run SEP-2575 discovery contract
+        run: |
+          endpoint=http://127.0.0.1:8002/mcp
+          common_headers=(
+            -H "Content-Type: application/json"
+            -H "Accept: application/json, text/event-stream"
+            -H "Mcp-Method: server/discover"
+          )
+
+          discover_response="$(
+            curl --fail-with-body --silent --show-error \
+              "${common_headers[@]}" \
+              -H "MCP-Protocol-Version: 2026-07-28" \
+              --data '{
+                "jsonrpc": "2.0",
+                "id": "discover",
+                "method": "server/discover",
+                "params": {
+                  "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                      "name": "conformance-workflow",
+                      "version": "1.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                  }
+                }
+              }' \
+              "$endpoint"
+          )"
+          jq -e '
+            .result.resultType == "complete" and
+            (.result.supportedVersions | index("2026-07-28") != null) and
+            (.result.capabilities | type == "object") and
+            (.result.serverInfo.name | type == "string") and
+            .result.ttlMs == 0 and
+            .result.cacheScope == "private"
+          ' <<<"$discover_response"
+
+          status="$(
+            curl --silent --show-error \
+              --output /tmp/unsupported-version.json \
+              --write-out "%{http_code}" \
+              "${common_headers[@]}" \
+              -H "MCP-Protocol-Version: 2099-01-01" \
+              --data '{
+                "jsonrpc": "2.0",
+                "id": "unsupported",
+                "method": "server/discover",
+                "params": {
+                  "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+                    "io.modelcontextprotocol/clientInfo": {
+                      "name": "conformance-workflow",
+                      "version": "1.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                  }
+                }
+              }' \
+              "$endpoint"
+          )"
+          test "$status" = "400"
+          jq -e '
+            .id == "unsupported" and
+            .error.code == -32022 and
+            .error.data.requested == "2099-01-01" and
+            (.error.data.supported | index("2026-07-28") != null)
+          ' /tmp/unsupported-version.json
+
+      # Keep this explicit list until the full draft suite is enabled by #985.
+      - name: Run supported draft server scenarios
+        run: |
+          for scenario in \
+            sep-2164-resource-not-found \
+            caching \
+            http-header-validation \
+            http-custom-header-server-validation \
+            input-required-result-basic-elicitation \
+            input-required-result-basic-sampling \
+            input-required-result-basic-list-roots \
+            input-required-result-request-state \
+            input-required-result-multiple-input-requests \
+            input-required-result-multi-round \
+            input-required-result-missing-input-response \
+            input-required-result-non-tool-request \
+            input-required-result-result-type \
+            input-required-result-unsupported-methods \
+            input-required-result-tampered-state \
+            input-required-result-capability-check \
+            input-required-result-ignore-extra-params \
+            input-required-result-validate-input \
+          ; do
+            npx -y "@modelcontextprotocol/conformance@${DRAFT_CONFORMANCE_VERSION}" server \
+              --url http://127.0.0.1:8002/mcp \
+              --scenario "$scenario" \
+              --spec-version draft \
+              -o conformance-results
+          done
+
+      - name: Stop conformance servers
         if: always()
-        run: kill "$(cat server.pid)" 2>/dev/null || true
+        run: |
+          kill "$(cat draft-server.pid)" 2>/dev/null || true
+          kill "$(cat server.pid)" 2>/dev/null || true
 
       - name: Upload results
         if: always()
@@ -75,3 +194,49 @@ jobs:
         with:
           name: conformance-server-results
           path: conformance-results
+
+  client:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build conformance binaries
+        run: cargo build -p mcp-conformance
+
+      - name: Run 2025-11-25 client suite
+        run: |
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" client \
+            --command "$(pwd)/target/debug/conformance-client" \
+            --suite all \
+            --spec-version 2025-11-25 \
+            -o conformance-client-results/full
+
+      # SEP-2322 MRTR client scenario (spec 2026-07-28).
+      - name: Run draft SEP-2322 client scenario
+        run: |
+          npx -y "@modelcontextprotocol/conformance@${DRAFT_CONFORMANCE_VERSION}" client \
+            --command "$(pwd)/target/debug/conformance-client" \
+            --scenario sep-2322-client-request-state \
+            -o conformance-client-results/mrtr
+
+      - name: Run draft SEP-2575 client scenario
+        run: |
+          npx -y "@modelcontextprotocol/conformance@${DRAFT_CONFORMANCE_VERSION}" client \
+            --command "$(pwd)/target/debug/conformance-client" \
+            --scenario request-metadata \
+            --spec-version draft \
+            -o conformance-client-results/sep-2575
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-client-results
+          path: conformance-client-results

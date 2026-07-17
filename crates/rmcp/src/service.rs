@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use futures::FutureExt;
 #[cfg(not(feature = "local"))]
 use futures::future::BoxFuture;
@@ -51,9 +53,10 @@ use crate::model::ServerNotification;
 use crate::{
     error::ErrorData as McpError,
     model::{
-        CancelledNotification, CancelledNotificationParam, ErrorCode, Extensions, GetExtensions,
-        GetMeta, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-        JsonRpcResponse, Meta, NumberOrString, ProgressToken, RequestId,
+        CancelledNotification, CancelledNotificationParam, ClientCapabilities, ErrorCode,
+        Extensions, GetExtensions, GetMeta, Implementation, JsonRpcError, JsonRpcMessage,
+        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, NotificationMetaObject,
+        NumberOrString, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
     },
     transport::{DynamicTransportError, IntoTransport, Transport},
 };
@@ -86,6 +89,9 @@ pub enum ServiceError {
     Cancelled { reason: Option<String> },
     #[error("request timeout after {}", chrono::Duration::from_std(*timeout).unwrap_or_default())]
     Timeout { timeout: Duration },
+    /// The peer kept returning `input_required` beyond the configured round cap.
+    #[error("input_required did not complete within {max_rounds} MRTR rounds")]
+    InputRequiredRoundsExceeded { max_rounds: usize },
 }
 
 trait TransferObject:
@@ -106,17 +112,17 @@ impl<T> TransferObject for T where
 
 #[allow(private_bounds, reason = "there's no the third implementation")]
 pub trait ServiceRole: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
-    type Req: TransferObject + GetMeta + GetExtensions;
+    type Req: TransferObject + GetMeta<Metadata = RequestMetaObject> + GetExtensions;
     type Resp: TransferObject;
     type Not: TryInto<CancelledNotification, Error = Self::Not>
         + From<CancelledNotification>
         + TransferObject;
-    type PeerReq: TransferObject + GetMeta + GetExtensions;
+    type PeerReq: TransferObject + GetMeta<Metadata = RequestMetaObject> + GetExtensions;
     type PeerResp: TransferObject;
     type PeerNot: TryInto<CancelledNotification, Error = Self::PeerNot>
         + From<CancelledNotification>
         + TransferObject
-        + GetMeta
+        + GetMeta<Metadata = NotificationMetaObject>
         + GetExtensions;
     type InitializeError;
     const IS_CLIENT: bool;
@@ -512,6 +518,13 @@ pub(crate) enum PeerSinkMessage<R: ServiceRole> {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClientRequestMetadata {
+    pub protocol_version: ProtocolVersion,
+    pub client_info: Implementation,
+    pub client_capabilities: ClientCapabilities,
+}
+
 /// An interface to fetch the remote client or server
 ///
 /// For general purpose, call [`Peer::send_request`] or [`Peer::send_notification`] to send message to remote peer.
@@ -524,6 +537,8 @@ pub struct Peer<R: ServiceRole> {
     progress_token_provider: Arc<dyn ProgressTokenProvider>,
     progress_timeout_watchers: ProgressTimeoutWatchers,
     info: Arc<std::sync::RwLock<Option<Arc<R::PeerInfo>>>>,
+    client_request_metadata: Arc<OnceLock<ClientRequestMetadata>>,
+    request_metadata_required: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<R: ServiceRole> std::fmt::Debug for Peer<R> {
@@ -541,7 +556,7 @@ type ProxyOutbound<R> = mpsc::Receiver<PeerSinkMessage<R>>;
 #[non_exhaustive]
 pub struct PeerRequestOptions {
     pub timeout: Option<Duration>,
-    pub meta: Option<Meta>,
+    pub meta: Option<RequestMetaObject>,
     /// Reset the request timeout when a matching progress notification is received.
     pub reset_timeout_on_progress: bool,
     /// Maximum total time to wait for the request, regardless of progress notifications.
@@ -558,6 +573,14 @@ impl PeerRequestOptions {
             timeout: Some(timeout),
             ..Self::default()
         }
+    }
+
+    /// Adds request metadata while preserving any other configured options.
+    ///
+    /// Explicit values take precedence over discover-lifecycle metadata defaults.
+    pub fn with_meta(mut self, meta: RequestMetaObject) -> Self {
+        self.meta = Some(meta);
+        self
     }
 
     pub fn reset_timeout_on_progress(mut self) -> Self {
@@ -585,6 +608,8 @@ impl<R: ServiceRole> Peer<R> {
                 progress_token_provider: Arc::new(AtomicU32ProgressTokenProvider::default()),
                 progress_timeout_watchers: Default::default(),
                 info: Arc::new(std::sync::RwLock::new(peer_info.map(Arc::new))),
+                client_request_metadata: Default::default(),
+                request_metadata_required: Default::default(),
             },
             rx,
         )
@@ -622,6 +647,12 @@ impl<R: ServiceRole> Peer<R> {
     ) -> Result<RequestHandle<R>, ServiceError> {
         let id = self.request_id_provider.next_request_id();
         let progress_token = self.progress_token_provider.next_progress_token();
+        if let Some(metadata) = self.client_request_metadata.get() {
+            let meta = request.get_meta_mut();
+            meta.set_protocol_version(metadata.protocol_version.clone());
+            meta.set_client_info(metadata.client_info.clone());
+            meta.set_client_capabilities(metadata.client_capabilities.clone());
+        }
         if let Some(meta) = options.meta.clone() {
             request.get_meta_mut().extend(meta);
         }
@@ -698,6 +729,21 @@ impl<R: ServiceRole> Peer<R> {
     /// Stores the peer's handshake info, overwriting any previous value.
     pub fn set_peer_info(&self, info: R::PeerInfo) {
         *self.info.write().expect("peer info lock poisoned") = Some(Arc::new(info));
+    }
+
+    pub(crate) fn set_client_request_metadata(&self, metadata: ClientRequestMetadata) {
+        let result = self.client_request_metadata.set(metadata);
+        debug_assert!(result.is_ok(), "client request metadata set more than once");
+    }
+
+    pub(crate) fn require_request_metadata(&self) {
+        self.request_metadata_required
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn request_metadata_required(&self) -> bool {
+        self.request_metadata_required
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn is_transport_closed(&self) -> bool {
@@ -859,7 +905,7 @@ pub struct RequestContext<R: ServiceRole> {
     /// this token will be cancelled when the [`CancelledNotification`] is received.
     pub ct: CancellationToken,
     pub id: RequestId,
-    pub meta: Meta,
+    pub meta: RequestMetaObject,
     pub extensions: Extensions,
     /// An interface to fetch the remote client or server
     pub peer: Peer<R>,
@@ -871,7 +917,7 @@ impl<R: ServiceRole> RequestContext<R> {
         Self {
             ct: CancellationToken::new(),
             id,
-            meta: Meta::default(),
+            meta: RequestMetaObject::default(),
             extensions: Extensions::default(),
             peer,
         }
@@ -880,11 +926,35 @@ impl<R: ServiceRole> RequestContext<R> {
 
 #[cfg(feature = "server")]
 impl RequestContext<RoleServer> {
-    /// The protocol version the client negotiated, or `None` before peer info is recorded.
+    /// The current request's protocol version, falling back to legacy handshake state.
     pub fn protocol_version(&self) -> Option<crate::model::ProtocolVersion> {
-        self.peer
-            .peer_info()
-            .map(|info| info.protocol_version.clone())
+        self.meta.protocol_version().or_else(|| {
+            self.peer
+                .peer_info()
+                .map(|info| info.protocol_version.clone())
+        })
+    }
+
+    /// The current request's client implementation, falling back only for legacy sessions.
+    pub fn client_info(&self) -> Option<Implementation> {
+        if self.peer.request_metadata_required() {
+            self.meta.client_info()
+        } else {
+            self.meta
+                .client_info()
+                .or_else(|| self.peer.peer_info().map(|info| info.client_info.clone()))
+        }
+    }
+
+    /// The current request's client capabilities, falling back only for legacy sessions.
+    pub fn client_capabilities(&self) -> Option<ClientCapabilities> {
+        if self.peer.request_metadata_required() {
+            self.meta.client_capabilities()
+        } else {
+            self.meta
+                .client_capabilities()
+                .or_else(|| self.peer.peer_info().map(|info| info.capabilities.clone()))
+        }
     }
 }
 
@@ -892,7 +962,7 @@ impl RequestContext<RoleServer> {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NotificationContext<R: ServiceRole> {
-    pub meta: Meta,
+    pub meta: NotificationMetaObject,
     pub extensions: Extensions,
     /// An interface to fetch the remote client or server
     pub peer: Peer<R>,
@@ -1103,9 +1173,11 @@ where
                         JsonRpcMessage::Error(error) => error.id.as_ref(),
                         _ => None,
                     } {
-                        if let Some(ct) = local_ct_pool.remove(id) {
-                            ct.cancel();
-                        }
+                        let Some(ct) = local_ct_pool.remove(id) else {
+                            tracing::debug!(%id, "dropping response for cancelled request");
+                            continue;
+                        };
+                        ct.cancel();
                         let send = transport.send(m);
                         let current_span = tracing::Span::current();
                         response_send_tasks.spawn(async move {
@@ -1166,7 +1238,7 @@ where
                         let context_ct = request_ct.child_token();
                         local_ct_pool.insert(id.clone(), request_ct);
                         let mut extensions = Extensions::new();
-                        let mut meta = Meta::new();
+                        let mut meta = RequestMetaObject::new();
                         // avoid clone
                         // swap meta firstly, otherwise progress token will be lost
                         std::mem::swap(&mut meta, request.get_meta_mut());
@@ -1227,7 +1299,7 @@ where
                     {
                         let service = shared_service.clone();
                         let mut extensions = Extensions::new();
-                        let mut meta = Meta::new();
+                        let mut meta = NotificationMetaObject::new();
                         // avoid clone
                         std::mem::swap(&mut extensions, notification.extensions_mut());
                         std::mem::swap(&mut meta, notification.get_meta_mut());

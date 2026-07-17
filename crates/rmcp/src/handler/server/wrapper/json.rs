@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{
     handler::server::tool::IntoCallToolResult,
-    model::{CallToolResult, ContentBlock},
+    model::{CallToolResponse, CallToolResult, ContentBlock},
 };
 
 /// Json wrapper for structured output
@@ -30,7 +30,7 @@ impl<T: JsonSchema> JsonSchema for Json<T> {
 
 // Implementation for Json<T> to create structured content
 impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for Json<T> {
-    fn into_call_tool_result(self) -> Result<CallToolResult, crate::ErrorData> {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, crate::ErrorData> {
         let value = serde_json::to_value(self.0).map_err(|e| {
             crate::ErrorData::internal_error(
                 format!("Failed to serialize structured content: {}", e),
@@ -38,7 +38,7 @@ impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for Json<T> {
             )
         })?;
 
-        Ok(CallToolResult::structured(value))
+        Ok(CallToolResult::structured(value).into())
     }
 }
 
@@ -79,7 +79,7 @@ impl<T: JsonSchema> JsonSchema for JsonAndArtifact<T> {
 }
 
 impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for JsonAndArtifact<T> {
-    fn into_call_tool_result(self) -> Result<CallToolResult, crate::ErrorData> {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, crate::ErrorData> {
         let value = serde_json::to_value(self.value).map_err(|e| {
             crate::ErrorData::internal_error(
                 format!("Failed to serialize structured content: {}", e),
@@ -89,7 +89,7 @@ impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for JsonAndArtifact
 
         let mut result = CallToolResult::structured(value);
         result.content.extend(self.extras);
-        Ok(result)
+        Ok(result.into())
     }
 }
 
@@ -112,12 +112,14 @@ mod tests {
     #[test]
     fn json_and_artifact_no_extras_matches_json_shape() {
         let value = DummyResp { count: 7 };
-        let result = JsonAndArtifact {
+        let CallToolResponse::Complete(result) = JsonAndArtifact {
             value,
             extras: vec![],
         }
         .into_call_tool_result()
-        .unwrap();
+        .unwrap() else {
+            panic!("expected complete CallToolResult");
+        };
 
         assert!(result.structured_content.is_some());
         let stored = result.structured_content.as_ref().unwrap();
@@ -136,12 +138,14 @@ mod tests {
         let value = DummyResp { count: 3 };
         let raw = Resource::new("studio://download/uuid/file.png", "file.png");
         let link = ContentBlock::resource_link(raw);
-        let result = JsonAndArtifact {
+        let CallToolResponse::Complete(result) = JsonAndArtifact {
             value,
             extras: vec![link],
         }
         .into_call_tool_result()
-        .unwrap();
+        .unwrap() else {
+            panic!("expected complete CallToolResult");
+        };
 
         assert!(result.structured_content.is_some());
         assert_eq!(result.content.len(), 2, "JSON dump + resource_link");
@@ -160,9 +164,12 @@ mod tests {
             ContentBlock::resource_link(raw),
             ContentBlock::text("summary"),
         ];
-        let result = JsonAndArtifact { value, extras }
+        let CallToolResponse::Complete(result) = JsonAndArtifact { value, extras }
             .into_call_tool_result()
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected complete CallToolResult");
+        };
 
         assert_eq!(result.content.len(), 3);
         assert!(result.content[1].as_resource_link().is_some());

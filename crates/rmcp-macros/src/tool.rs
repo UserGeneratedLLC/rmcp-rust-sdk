@@ -32,14 +32,6 @@ fn extract_schema_from_return_type(ret_type: &syn::Type) -> Option<Expr> {
     if let Some(inner_type) = extract_json_inner_type(ret_type) {
         return syn::parse2::<Expr>(quote! {
             rmcp::handler::server::tool::schema_for_output::<#inner_type>()
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Invalid output schema for Json<{}> / JsonAndArtifact<{}>: {}",
-                        std::any::type_name::<#inner_type>(),
-                        std::any::type_name::<#inner_type>(),
-                        e
-                    )
-                })
         })
         .ok();
     }
@@ -70,14 +62,6 @@ fn extract_schema_from_return_type(ret_type: &syn::Type) -> Option<Expr> {
 
     syn::parse2::<Expr>(quote! {
         rmcp::handler::server::tool::schema_for_output::<#inner_type>()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Invalid output schema for Result<Json<{}> | JsonAndArtifact<{}>, E>: {}",
-                    std::any::type_name::<#inner_type>(),
-                    std::any::type_name::<#inner_type>(),
-                    e
-                )
-            })
     })
     .ok()
 }

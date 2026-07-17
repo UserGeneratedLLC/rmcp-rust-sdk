@@ -179,7 +179,7 @@ impl Counter {
     /// This is an example prompt that takes one required argument, message
     #[prompt(
         name = "example_prompt",
-        meta = Meta(rmcp::object!({"meta_key": "meta_value"}))
+        meta = MetaObject(rmcp::object!({"meta_key": "meta_value"}))
     )]
     async fn example_prompt(
         &self,
@@ -225,8 +225,8 @@ impl Counter {
     }
 }
 
-#[tool_handler(meta = Meta(rmcp::object!({"tool_meta_key": "tool_meta_value"})))]
-#[prompt_handler(meta = Meta(rmcp::object!({"router_meta_key": "router_meta_value"})))]
+#[tool_handler(meta = MetaObject(rmcp::object!({"tool_meta_key": "tool_meta_value"})))]
+#[prompt_handler(meta = MetaObject(rmcp::object!({"router_meta_key": "router_meta_value"})))]
 #[task_handler]
 impl ServerHandler for Counter {
     fn get_info(&self) -> ServerInfo {
@@ -252,8 +252,7 @@ impl ServerHandler for Counter {
                 self._create_resource_text("str:////Users/to/some/path/", "cwd"),
                 self._create_resource_text("memo://insights", "memo-name"),
             ],
-            next_cursor: None,
-            meta: None,
+            ..Default::default()
         })
     }
 
@@ -261,22 +260,16 @@ impl ServerHandler for Counter {
         &self,
         request: ReadResourceRequestParams,
         _: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = &request.uri;
         match uri.as_str() {
             "str:////Users/to/some/path/" => {
                 let cwd = "/Users/to/some/path/";
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    cwd,
-                    uri.clone(),
-                )]))
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(cwd, uri.clone())]).into())
             }
             "memo://insights" => {
                 let memo = "Business Intelligence Memo\n\nAnalysis has revealed 5 key insights ...";
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    memo,
-                    uri.clone(),
-                )]))
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(memo, uri.clone())]).into())
             }
             _ => Err(McpError::resource_not_found(
                 "resource_not_found",
@@ -293,9 +286,8 @@ impl ServerHandler for Counter {
         _: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult {
-            next_cursor: None,
             resource_templates: Vec::new(),
-            meta: None,
+            ..Default::default()
         })
     }
 

@@ -9,7 +9,7 @@ use crate::{
         tool::schema_for_output,
         wrapper::{Json, Parameters},
     },
-    model::{Icon, JsonObject, Meta, ToolAnnotations, ToolExecution},
+    model::{Icon, JsonObject, MetaObject, ToolAnnotations, ToolExecution},
     schemars::JsonSchema,
     service::{MaybeSend, MaybeSendFuture},
 };
@@ -65,13 +65,7 @@ pub trait ToolBase {
     ///
     /// If the tool does not have any output, you should override this methods to return [`None`].
     fn output_schema() -> Option<Arc<JsonObject>> {
-        Some(schema_for_output::<Self::Output>().unwrap_or_else(|e| {
-            panic!(
-                "Invalid output schema for ToolBase::Output type `{0}`: {1}",
-                std::any::type_name::<Self::Output>(),
-                e,
-            );
-        }))
+        Some(schema_for_output::<Self::Output>())
     }
 
     fn annotations() -> Option<ToolAnnotations> {
@@ -83,7 +77,7 @@ pub trait ToolBase {
     fn icons() -> Option<Vec<Icon>> {
         None
     }
-    fn meta() -> Option<Meta> {
+    fn meta() -> Option<MetaObject> {
         None
     }
 }

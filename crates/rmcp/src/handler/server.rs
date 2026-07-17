@@ -1,6 +1,6 @@
 // Sampling/Roots/Logging are SEP-2577-deprecated; internal references are expected.
 #![expect(deprecated)]
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::{
     error::ErrorData as McpError,
@@ -27,11 +27,57 @@ impl<H: ServerHandler> Service<RoleServer> for H {
     ) -> Result<<RoleServer as ServiceRole>::Resp, McpError> {
         // `context` is moved into the dispatch below, so read the negotiated version first.
         let protocol_version = context.protocol_version();
+        let mrtr_supported = protocol_version
+            .as_ref()
+            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+        let requested_version = context.meta.protocol_version();
+        let uses_inline_negotiation = !matches!(&request, ClientRequest::InitializeRequest(_));
+        if uses_inline_negotiation && let Some(requested_version) = requested_version.as_ref() {
+            let supported_versions = self.supported_protocol_versions();
+            if !supported_versions.contains(requested_version) {
+                return Err(McpError::unsupported_protocol_version(
+                    requested_version.clone(),
+                    &supported_versions,
+                ));
+            }
+        }
+        // Self-contained metadata is required only when the request itself uses
+        // the inline lifecycle: a discover opener, a session that started without
+        // `initialize`, or a request that declares 2026-07-28+ in its own _meta.
+        // Sessions that negotiated via `initialize` (or `serve_directly`) keep the
+        // session model and may omit per-request metadata.
+        let requires_request_metadata = uses_inline_negotiation
+            && (matches!(&request, ClientRequest::DiscoverRequest(_))
+                || context.peer.request_metadata_required()
+                || requested_version.as_ref().is_some_and(|version| {
+                    version.as_str() >= ProtocolVersion::V_2026_07_28.as_str()
+                }));
+        if requires_request_metadata {
+            // Inline lifecycle requests are defined by the 2026-07-28 protocol.
+            // Validate that lifecycle contract even when a request selects an
+            // older application protocol version.
+            let missing = context
+                .meta
+                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
+            if !missing.is_empty() {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "request _meta is missing or has malformed required fields: {}",
+                        missing.join(", ")
+                    ),
+                    None,
+                ));
+            }
+        }
         let result = match request {
             ClientRequest::InitializeRequest(request) => self
                 .initialize(request.params, context)
                 .await
                 .map(ServerResult::InitializeResult),
+            ClientRequest::DiscoverRequest(_request) => self
+                .discover(context)
+                .await
+                .map(ServerResult::DiscoverResult),
             ClientRequest::PingRequest(_request) => {
                 self.ping(context).await.map(ServerResult::empty)
             }
@@ -46,7 +92,7 @@ impl<H: ServerHandler> Service<RoleServer> for H {
             ClientRequest::GetPromptRequest(request) => self
                 .get_prompt(request.params, context)
                 .await
-                .map(ServerResult::GetPromptResult),
+                .map(ServerResult::from),
             ClientRequest::ListPromptsRequest(request) => self
                 .list_prompts(request.params, context)
                 .await
@@ -62,7 +108,7 @@ impl<H: ServerHandler> Service<RoleServer> for H {
             ClientRequest::ReadResourceRequest(request) => self
                 .read_resource(request.params, context)
                 .await
-                .map(ServerResult::ReadResourceResult),
+                .map(ServerResult::from),
             ClientRequest::SubscribeRequest(request) => self
                 .subscribe(request.params, context)
                 .await
@@ -105,7 +151,7 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                 } else {
                     self.call_tool(request.params, context)
                         .await
-                        .map(ServerResult::CallToolResult)
+                        .map(ServerResult::from)
                 }
             }
             ClientRequest::ListToolsRequest(request) => self
@@ -133,6 +179,17 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                 .await
                 .map(ServerResult::CancelTaskResult),
         };
+        let result = result.and_then(|result| {
+            if matches!(result, ServerResult::InputRequiredResult(_)) && !mrtr_supported {
+                Err(McpError::invalid_request(
+                    "InputRequiredResult requires negotiated protocol version 2026-07-28 or newer",
+                    None,
+                ))
+            } else {
+                Ok(result)
+            }
+        });
+
         // SEP-2164: peers negotiating 2026-07-28+ get the standard INVALID_PARAMS code for
         // resource-not-found; older peers keep RESOURCE_NOT_FOUND. ISO `YYYY-MM-DD` versions
         // compare lexically the same as chronologically.
@@ -211,6 +268,20 @@ macro_rules! server_handler_methods {
             );
             std::future::ready(Ok(info))
         }
+        /// Return the protocol versions supported by this server.
+        fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+            Cow::Borrowed(ProtocolVersion::KNOWN_VERSIONS)
+        }
+        /// Return this server's discovery information.
+        fn discover(
+            &self,
+            context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<DiscoverResult, McpError>> + MaybeSendFuture + '_ {
+            std::future::ready(Ok(DiscoverResult::from_server_info(
+                self.supported_protocol_versions().into_owned(),
+                self.get_info(),
+            )))
+        }
         fn complete(
             &self,
             request: CompleteRequestParams,
@@ -229,7 +300,7 @@ macro_rules! server_handler_methods {
             &self,
             request: GetPromptRequestParams,
             context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<GetPromptResult, McpError>> + MaybeSendFuture + '_ {
+        ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + MaybeSendFuture + '_ {
             std::future::ready(Err(McpError::method_not_found::<GetPromptRequestMethod>()))
         }
         fn list_prompts(
@@ -259,7 +330,7 @@ macro_rules! server_handler_methods {
             &self,
             request: ReadResourceRequestParams,
             context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + MaybeSendFuture + '_ {
+        ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + MaybeSendFuture + '_ {
             std::future::ready(Err(
                 McpError::method_not_found::<ReadResourceRequestMethod>(),
             ))
@@ -312,7 +383,7 @@ macro_rules! server_handler_methods {
             &self,
             request: CallToolRequestParams,
             context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResult, McpError>> + MaybeSendFuture + '_ {
+        ) -> impl Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_ {
             std::future::ready(Err(McpError::method_not_found::<CallToolRequestMethod>()))
         }
         fn list_tools(
@@ -465,6 +536,17 @@ macro_rules! impl_server_handler_for_wrapper {
                 (**self).initialize(request, context)
             }
 
+            fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+                (**self).supported_protocol_versions()
+            }
+
+            fn discover(
+                &self,
+                context: RequestContext<RoleServer>,
+            ) -> impl Future<Output = Result<DiscoverResult, McpError>> + MaybeSendFuture + '_ {
+                (**self).discover(context)
+            }
+
             fn complete(
                 &self,
                 request: CompleteRequestParams,
@@ -485,7 +567,7 @@ macro_rules! impl_server_handler_for_wrapper {
                 &self,
                 request: GetPromptRequestParams,
                 context: RequestContext<RoleServer>,
-            ) -> impl Future<Output = Result<GetPromptResult, McpError>> + MaybeSendFuture + '_ {
+            ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + MaybeSendFuture + '_ {
                 (**self).get_prompt(request, context)
             }
 
@@ -518,7 +600,7 @@ macro_rules! impl_server_handler_for_wrapper {
                 &self,
                 request: ReadResourceRequestParams,
                 context: RequestContext<RoleServer>,
-            ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + MaybeSendFuture + '_ {
+            ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + MaybeSendFuture + '_ {
                 (**self).read_resource(request, context)
             }
 
@@ -542,7 +624,7 @@ macro_rules! impl_server_handler_for_wrapper {
                 &self,
                 request: CallToolRequestParams,
                 context: RequestContext<RoleServer>,
-            ) -> impl Future<Output = Result<CallToolResult, McpError>> + MaybeSendFuture + '_ {
+            ) -> impl Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_ {
                 (**self).call_tool(request, context)
             }
 

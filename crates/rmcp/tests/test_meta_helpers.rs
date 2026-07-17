@@ -1,6 +1,8 @@
 #![allow(deprecated)]
 
-use rmcp::model::{ClientCapabilities, Implementation, LoggingLevel, Meta, ProtocolVersion};
+use rmcp::model::{
+    ClientCapabilities, Implementation, LoggingLevel, ProtocolVersion, RequestMetaObject,
+};
 use serde_json::json;
 
 const META_KEY_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
@@ -10,7 +12,7 @@ const META_KEY_LOG_LEVEL: &str = "io.modelcontextprotocol/logLevel";
 
 #[test]
 fn meta_setters_store_sep_2575_values() {
-    let mut meta = Meta::new();
+    let mut meta = RequestMetaObject::new();
     meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
     meta.set_client_info(Implementation::new("test-client", "1.0.0"));
     meta.set_client_capabilities(ClientCapabilities::default());
@@ -29,8 +31,31 @@ fn meta_setters_store_sep_2575_values() {
 }
 
 #[test]
+fn with_client_context_sets_all_required_sep_2575_fields() {
+    let meta = RequestMetaObject::with_client_context(
+        ProtocolVersion::V_2026_07_28,
+        Implementation::new("test-client", "1.0.0"),
+        ClientCapabilities::default(),
+    );
+
+    assert!(
+        meta.missing_required_keys(&ProtocolVersion::V_2026_07_28)
+            .is_empty()
+    );
+    assert_eq!(meta.protocol_version(), Some(ProtocolVersion::V_2026_07_28));
+    assert_eq!(
+        meta.client_info(),
+        Some(Implementation::new("test-client", "1.0.0"))
+    );
+    assert_eq!(
+        meta.client_capabilities(),
+        Some(ClientCapabilities::default())
+    );
+}
+
+#[test]
 fn meta_accessors_decode_wire_values() {
-    let meta: Meta = serde_json::from_value(json!({
+    let meta: RequestMetaObject = serde_json::from_value(json!({
         "progressToken": "progress-1",
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientInfo": {
@@ -58,7 +83,7 @@ fn meta_accessors_decode_wire_values() {
 
 #[test]
 fn meta_accessors_ignore_missing_or_malformed_values() {
-    let meta: Meta = serde_json::from_value(json!({
+    let meta: RequestMetaObject = serde_json::from_value(json!({
         "io.modelcontextprotocol/protocolVersion": 20260728,
         "io.modelcontextprotocol/clientInfo": "not an implementation",
         "io.modelcontextprotocol/clientCapabilities": "not capabilities",

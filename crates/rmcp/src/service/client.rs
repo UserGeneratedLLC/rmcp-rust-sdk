@@ -1,24 +1,28 @@
 // Sampling/Roots/Logging are SEP-2577-deprecated; internal references are expected.
 #![expect(deprecated)]
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
 use super::*;
 use crate::{
     model::{
-        ArgumentInfo, CallToolRequest, CallToolRequestParams, CallToolResult,
+        ArgumentInfo, CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
         CancelledNotification, CancelledNotificationParam, ClientInfo, ClientJsonRpcMessage,
         ClientNotification, ClientRequest, ClientResult, CompleteRequest, CompleteRequestParams,
-        CompleteResult, CompletionContext, CompletionInfo, ErrorData, GetPromptRequest,
-        GetPromptRequestParams, GetPromptResult, InitializeRequest, InitializedNotification,
-        JsonRpcResponse, ListPromptsRequest, ListPromptsResult, ListResourceTemplatesRequest,
-        ListResourceTemplatesResult, ListResourcesRequest, ListResourcesResult, ListToolsRequest,
-        ListToolsResult, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
-        ReadResourceRequest, ReadResourceRequestParams, ReadResourceResult, Reference, RequestId,
-        RootsListChangedNotification, ServerInfo, ServerJsonRpcMessage, ServerNotification,
-        ServerRequest, ServerResult, SetLevelRequest, SetLevelRequestParams, SubscribeRequest,
-        SubscribeRequestParams, UnsubscribeRequest, UnsubscribeRequestParams,
+        CompleteResult, CompletionContext, CompletionInfo, DEFAULT_MRTR_MAX_ROUNDS,
+        DiscoverRequest, DiscoverRequestParams, DiscoverResult, ErrorData, GetExtensions, GetMeta,
+        GetPromptRequest, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+        InitializeRequest, InitializedNotification, InputRequest, InputRequiredResult,
+        InputResponses, JsonRpcResponse, ListPromptsRequest, ListPromptsResult,
+        ListResourceTemplatesRequest, ListResourceTemplatesResult, ListResourcesRequest,
+        ListResourcesResult, ListToolsRequest, ListToolsResult, NumberOrString,
+        PaginatedRequestParams, ProgressNotification, ProgressNotificationParam, ProtocolVersion,
+        ReadResourceRequest, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+        Reference, RequestId, RequestMetaObject, RootsListChangedNotification, ServerInfo,
+        ServerJsonRpcMessage, ServerNotification, ServerRequest, ServerResult, SetLevelRequest,
+        SetLevelRequestParams, SubscribeRequest, SubscribeRequestParams, UnsubscribeRequest,
+        UnsubscribeRequestParams,
     },
     transport::DynamicTransportError,
 };
@@ -49,6 +53,17 @@ pub enum ClientInitializeError {
 
     #[error("JSON-RPC error: {0}")]
     JsonRpcError(ErrorData),
+
+    #[error(
+        "no compatible protocol version (client: {client_supported:?}, server: {server_supported:?})"
+    )]
+    NoCompatibleProtocolVersion {
+        client_supported: Vec<ProtocolVersion>,
+        server_supported: Vec<ProtocolVersion>,
+    },
+
+    #[error("discover startup requires at least one preferred protocol version")]
+    NoPreferredProtocolVersion,
 
     #[error("Cancelled")]
     Cancelled,
@@ -113,11 +128,11 @@ where
 
                 let mut context = NotificationContext {
                     peer: peer.clone(),
-                    meta: Meta::default(),
+                    meta: NotificationMetaObject::default(),
                     extensions: Extensions::default(),
                 };
 
-                if let Some(meta) = logging.extensions.get_mut::<Meta>() {
+                if let Some(meta) = logging.extensions.get_mut::<NotificationMetaObject>() {
                     std::mem::swap(&mut context.meta, meta);
                 }
                 std::mem::swap(&mut context.extensions, &mut logging.extensions);
@@ -145,6 +160,19 @@ where
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct RoleClient;
 
+/// Select the first client-preferred protocol version supported by the server.
+///
+/// Returns `None` when no version is shared.
+pub fn select_protocol_version(
+    client_preference: &[ProtocolVersion],
+    server_supported: &[ProtocolVersion],
+) -> Option<ProtocolVersion> {
+    client_preference
+        .iter()
+        .find(|version| server_supported.contains(version))
+        .cloned()
+}
+
 impl ServiceRole for RoleClient {
     type Req = ClientRequest;
     type Resp = ClientResult;
@@ -159,6 +187,43 @@ impl ServiceRole for RoleClient {
 }
 
 pub type ServerSink = Peer<RoleClient>;
+
+/// Selects how a client establishes its MCP lifecycle.
+///
+/// Existing [`ServiceExt::serve`] behavior remains legacy initialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientLifecycleMode {
+    /// Use the legacy `initialize` / `notifications/initialized` handshake.
+    Initialize,
+    /// Use `server/discover` and send self-contained per-request metadata.
+    Discover {
+        preferred_versions: Vec<ProtocolVersion>,
+    },
+    /// Probe with `server/discover`, falling back only when the peer proves it is legacy.
+    Auto {
+        preferred_versions: Vec<ProtocolVersion>,
+        legacy_version: Option<ProtocolVersion>,
+    },
+}
+
+/// Client-specific lifecycle entry points.
+pub trait ClientServiceExt: Service<RoleClient> + Sized {
+    fn serve_with_lifecycle<T, E, A>(
+        self,
+        transport: T,
+        lifecycle: ClientLifecycleMode,
+    ) -> impl Future<Output = Result<RunningService<RoleClient, Self>, ClientInitializeError>>
+    + MaybeSendFuture
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        serve_client_with_lifecycle(self, transport, lifecycle)
+    }
+}
+
+impl<S: Service<RoleClient>> ClientServiceExt for S {}
 
 impl<S: Service<RoleClient>> ServiceExt<RoleClient> for S {
     fn serve_with_ct<T, E, A>(
@@ -185,7 +250,13 @@ where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    serve_client_with_ct(service, transport, Default::default()).await
+    serve_client_with_lifecycle_and_ct(
+        service,
+        transport,
+        ClientLifecycleMode::Initialize,
+        Default::default(),
+    )
+    .await
 }
 
 pub async fn serve_client_with_ct<S, T, E, A>(
@@ -198,8 +269,36 @@ where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
+    serve_client_with_lifecycle_and_ct(service, transport, ClientLifecycleMode::Initialize, ct)
+        .await
+}
+
+pub async fn serve_client_with_lifecycle<S, T, E, A>(
+    service: S,
+    transport: T,
+    lifecycle: ClientLifecycleMode,
+) -> Result<RunningService<RoleClient, S>, ClientInitializeError>
+where
+    S: Service<RoleClient>,
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    serve_client_with_lifecycle_and_ct(service, transport, lifecycle, Default::default()).await
+}
+
+pub async fn serve_client_with_lifecycle_and_ct<S, T, E, A>(
+    service: S,
+    transport: T,
+    lifecycle: ClientLifecycleMode,
+    ct: CancellationToken,
+) -> Result<RunningService<RoleClient, S>, ClientInitializeError>
+where
+    S: Service<RoleClient>,
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     tokio::select! {
-        result = serve_client_with_ct_inner(service, transport.into_transport(), ct.clone()) => { result }
+        result = serve_client_with_ct_inner(service, transport.into_transport(), lifecycle, ct.clone()) => { result }
         _ = ct.cancelled() => {
             Err(ClientInitializeError::Cancelled)
         }
@@ -209,6 +308,7 @@ where
 async fn serve_client_with_ct_inner<S, T>(
     service: S,
     transport: T,
+    lifecycle: ClientLifecycleMode,
     ct: CancellationToken,
 ) -> Result<RunningService<RoleClient, S>, ClientInitializeError>
 where
@@ -217,12 +317,71 @@ where
 {
     let mut transport = transport.into_transport();
     let id_provider = <Arc<AtomicU32RequestIdProvider>>::default();
+    let (peer, peer_rx) = Peer::new(id_provider.clone(), None);
+    let client_info = service.get_info();
 
-    // service
+    match lifecycle {
+        ClientLifecycleMode::Initialize => {
+            legacy_startup(&service, &mut transport, &id_provider, &peer, client_info).await?;
+        }
+        ClientLifecycleMode::Discover { preferred_versions } => {
+            discover_startup(
+                &service,
+                &mut transport,
+                &id_provider,
+                &peer,
+                &client_info,
+                preferred_versions,
+            )
+            .await?;
+        }
+        ClientLifecycleMode::Auto {
+            preferred_versions,
+            legacy_version,
+        } => {
+            let discover_result = discover_startup(
+                &service,
+                &mut transport,
+                &id_provider,
+                &peer,
+                &client_info,
+                preferred_versions,
+            )
+            .await;
+            match discover_result {
+                Ok(()) => {}
+                Err(ClientInitializeError::JsonRpcError(error))
+                    if error.code == crate::model::ErrorCode::METHOD_NOT_FOUND =>
+                {
+                    let mut legacy_info = client_info;
+                    if let Some(version) = legacy_version {
+                        legacy_info.protocol_version = version;
+                    }
+                    legacy_startup(&service, &mut transport, &id_provider, &peer, legacy_info)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(serve_inner(service, transport, peer, peer_rx, ct))
+}
+
+async fn legacy_startup<S, T>(
+    service: &S,
+    transport: &mut T,
+    id_provider: &Arc<AtomicU32RequestIdProvider>,
+    peer: &Peer<RoleClient>,
+    client_info: ClientInfo,
+) -> Result<(), ClientInitializeError>
+where
+    S: Service<RoleClient>,
+    T: Transport<RoleClient> + 'static,
+{
     let id = id_provider.next_request_id();
     let init_request = InitializeRequest {
         method: Default::default(),
-        params: service.get_info(),
+        params: client_info,
         extensions: Default::default(),
     };
     transport
@@ -236,15 +395,8 @@ where
             context: "send initialize request".into(),
         })?;
 
-    let (peer, peer_rx) = Peer::new(id_provider, None);
-
-    let (response, response_id) = expect_response(
-        &mut transport,
-        "initialize response",
-        &service,
-        peer.clone(),
-    )
-    .await?;
+    let (response, response_id) =
+        expect_response(transport, "initialize response", service, peer.clone()).await?;
 
     if id != response_id {
         return Err(ClientInitializeError::ConflictInitResponseId(
@@ -268,7 +420,115 @@ where
     transport.send(notification).await.map_err(|error| {
         ClientInitializeError::transport::<T>(error, "send initialized notification")
     })?;
-    Ok(serve_inner(service, transport, peer, peer_rx, ct))
+    Ok(())
+}
+
+async fn discover_startup<S, T>(
+    service: &S,
+    transport: &mut T,
+    id_provider: &Arc<AtomicU32RequestIdProvider>,
+    peer: &Peer<RoleClient>,
+    client_info: &ClientInfo,
+    preferred_versions: Vec<ProtocolVersion>,
+) -> Result<(), ClientInitializeError>
+where
+    S: Service<RoleClient>,
+    T: Transport<RoleClient> + 'static,
+{
+    if preferred_versions.is_empty() {
+        return Err(ClientInitializeError::NoPreferredProtocolVersion);
+    }
+
+    let mut attempted = Vec::new();
+    let mut candidate = preferred_versions[0].clone();
+    loop {
+        attempted.push(candidate.clone());
+
+        let meta = RequestMetaObject::with_client_context(
+            candidate.clone(),
+            client_info.client_info.clone(),
+            client_info.capabilities.clone(),
+        );
+        let mut discover = DiscoverRequest::new(DiscoverRequestParams {});
+        discover.extensions.insert(meta);
+        let id = id_provider.next_request_id();
+        transport
+            .send(ClientJsonRpcMessage::request(
+                ClientRequest::DiscoverRequest(discover),
+                id.clone(),
+            ))
+            .await
+            .map_err(|error| {
+                ClientInitializeError::transport::<T>(error, "send discover request")
+            })?;
+
+        match expect_response(transport, "discover response", service, peer.clone()).await {
+            Ok((ServerResult::DiscoverResult(result), response_id)) => {
+                if response_id != id {
+                    return Err(ClientInitializeError::ConflictInitResponseId(
+                        id,
+                        response_id,
+                    ));
+                }
+                let Some(selected) =
+                    select_protocol_version(&preferred_versions, &result.supported_versions)
+                else {
+                    return Err(ClientInitializeError::NoCompatibleProtocolVersion {
+                        client_supported: preferred_versions,
+                        server_supported: result.supported_versions,
+                    });
+                };
+                peer.set_peer_info(ServerInfo {
+                    protocol_version: selected.clone(),
+                    capabilities: result.capabilities,
+                    server_info: result.server_info,
+                    instructions: result.instructions,
+                    meta: result.meta,
+                });
+                peer.set_client_request_metadata(ClientRequestMetadata {
+                    protocol_version: selected,
+                    client_info: client_info.client_info.clone(),
+                    client_capabilities: client_info.capabilities.clone(),
+                });
+                return Ok(());
+            }
+            Ok((response, _)) => {
+                return Err(ClientInitializeError::ExpectedInitResult(Some(response)));
+            }
+            Err(ClientInitializeError::JsonRpcError(error))
+                if error.code == crate::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION =>
+            {
+                let supported = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("supported"))
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<ProtocolVersion>>(value).ok())
+                    .unwrap_or_default();
+                let may_retry_current = attempted
+                    .iter()
+                    .filter(|version| *version == &candidate)
+                    .count()
+                    == 1;
+                let next = preferred_versions
+                    .iter()
+                    .find(|version| {
+                        supported.contains(version)
+                            && (!attempted.contains(version)
+                                || (may_retry_current && *version == &candidate))
+                    })
+                    .cloned();
+                let Some(next) = next else {
+                    return Err(ClientInitializeError::NoCompatibleProtocolVersion {
+                        client_supported: preferred_versions,
+                        server_supported: supported,
+                    });
+                };
+                candidate = next;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 macro_rules! method {
@@ -361,6 +621,88 @@ macro_rules! method {
 }
 
 impl Peer<RoleClient> {
+    /// Discover the server's supported protocol versions and capabilities.
+    ///
+    /// The high-level client currently exposes this peer only after initialization;
+    /// pre-initialization probing is planned as follow-up work.
+    pub async fn discover(&self, meta: RequestMetaObject) -> Result<DiscoverResult, ServiceError> {
+        let mut request = DiscoverRequest::new(DiscoverRequestParams {});
+        request.extensions.insert(meta);
+        let result = self
+            .send_request(ClientRequest::DiscoverRequest(request))
+            .await?;
+        match result {
+            ServerResult::DiscoverResult(result) => Ok(result),
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    /// Send one `tools/call` request and return either a final result or an MRTR
+    /// `InputRequiredResult` without driving any follow-up rounds.
+    pub async fn call_tool_once(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ServiceError> {
+        let result = self
+            .send_request(ClientRequest::CallToolRequest(CallToolRequest {
+                method: Default::default(),
+                params,
+                extensions: Default::default(),
+            }))
+            .await?;
+        match result {
+            ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(CallToolResponse::InputRequired(result))
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    /// Send one `prompts/get` request and return either a final result or an MRTR
+    /// `InputRequiredResult` without driving any follow-up rounds.
+    pub async fn get_prompt_once(
+        &self,
+        params: GetPromptRequestParams,
+    ) -> Result<GetPromptResponse, ServiceError> {
+        let result = self
+            .send_request(ClientRequest::GetPromptRequest(GetPromptRequest {
+                method: Default::default(),
+                params,
+                extensions: Default::default(),
+            }))
+            .await?;
+        match result {
+            ServerResult::GetPromptResult(result) => Ok(GetPromptResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(GetPromptResponse::InputRequired(result))
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    /// Send one `resources/read` request and return either a final result or an
+    /// MRTR `InputRequiredResult` without driving any follow-up rounds.
+    pub async fn read_resource_once(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResponse, ServiceError> {
+        let result = self
+            .send_request(ClientRequest::ReadResourceRequest(ReadResourceRequest {
+                method: Default::default(),
+                params,
+                extensions: Default::default(),
+            }))
+            .await?;
+        match result {
+            ServerResult::ReadResourceResult(result) => Ok(ReadResourceResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(ReadResourceResponse::InputRequired(result))
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
     method!(peer_req complete CompleteRequest(CompleteRequestParams) => CompleteResult);
     method!(
         #[deprecated(
@@ -556,5 +898,296 @@ impl Peer<RoleClient> {
             .complete_resource_argument(uri_template, argument_name, current_value, None)
             .await?;
         Ok(completion.values)
+    }
+}
+
+impl<S> RunningService<RoleClient, S>
+where
+    S: Service<RoleClient>,
+{
+    /// Send one `tools/call` request without driving MRTR follow-up rounds.
+    pub async fn call_tool_once(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ServiceError> {
+        self.peer.call_tool_once(params).await
+    }
+
+    /// Send one `prompts/get` request without driving MRTR follow-up rounds.
+    pub async fn get_prompt_once(
+        &self,
+        params: GetPromptRequestParams,
+    ) -> Result<GetPromptResponse, ServiceError> {
+        self.peer.get_prompt_once(params).await
+    }
+
+    /// Send one `resources/read` request without driving MRTR follow-up rounds.
+    pub async fn read_resource_once(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResponse, ServiceError> {
+        self.peer.read_resource_once(params).await
+    }
+
+    /// High-level `tools/call` helper that automatically fulfils SEP-2322
+    /// `input_required` rounds through the local [`ClientHandler`](crate::ClientHandler) service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InputRequiredRoundsExceeded`] if the peer does
+    /// not produce a final [`CallToolResult`] within the default MRTR round cap.
+    /// Other transport, protocol, and local input-handler errors are propagated.
+    pub async fn call_tool(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResult, ServiceError> {
+        self.call_tool_with_mrtr_max_rounds(params, DEFAULT_MRTR_MAX_ROUNDS)
+            .await
+    }
+
+    /// Same as [`Self::call_tool`], with an explicit MRTR round cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InputRequiredRoundsExceeded`] once `max_rounds`
+    /// `input_required` responses have been driven without receiving a final
+    /// [`CallToolResult`]. Other transport, protocol, and local input-handler
+    /// errors are propagated.
+    pub async fn call_tool_with_mrtr_max_rounds(
+        &self,
+        mut params: CallToolRequestParams,
+        max_rounds: usize,
+    ) -> Result<CallToolResult, ServiceError> {
+        let mut state_only_rounds = 0usize;
+        for _round in 0..max_rounds {
+            match self.peer.call_tool_once(params.clone()).await? {
+                CallToolResponse::Complete(result) => return Ok(result),
+                CallToolResponse::InputRequired(result) => {
+                    let (input_responses, request_state) = self
+                        .prepare_input_required_retry(result, &mut state_only_rounds)
+                        .await?;
+                    params.input_responses = input_responses;
+                    params.request_state = request_state;
+                }
+            }
+        }
+        Err(ServiceError::InputRequiredRoundsExceeded { max_rounds })
+    }
+
+    /// High-level `prompts/get` helper that automatically fulfils SEP-2322
+    /// `input_required` rounds through the local [`ClientHandler`](crate::ClientHandler) service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InputRequiredRoundsExceeded`] if the peer does
+    /// not produce a final [`GetPromptResult`] within the default MRTR round cap.
+    /// Other transport, protocol, and local input-handler errors are propagated.
+    pub async fn get_prompt(
+        &self,
+        params: GetPromptRequestParams,
+    ) -> Result<GetPromptResult, ServiceError> {
+        self.get_prompt_with_mrtr_max_rounds(params, DEFAULT_MRTR_MAX_ROUNDS)
+            .await
+    }
+
+    /// Same as [`Self::get_prompt`], with an explicit MRTR round cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InputRequiredRoundsExceeded`] once `max_rounds`
+    /// `input_required` responses have been driven without receiving a final
+    /// [`GetPromptResult`]. Other transport, protocol, and local input-handler
+    /// errors are propagated.
+    pub async fn get_prompt_with_mrtr_max_rounds(
+        &self,
+        mut params: GetPromptRequestParams,
+        max_rounds: usize,
+    ) -> Result<GetPromptResult, ServiceError> {
+        let mut state_only_rounds = 0usize;
+        for _round in 0..max_rounds {
+            match self.peer.get_prompt_once(params.clone()).await? {
+                GetPromptResponse::Complete(result) => return Ok(result),
+                GetPromptResponse::InputRequired(result) => {
+                    let (input_responses, request_state) = self
+                        .prepare_input_required_retry(result, &mut state_only_rounds)
+                        .await?;
+                    params.input_responses = input_responses;
+                    params.request_state = request_state;
+                }
+            }
+        }
+        Err(ServiceError::InputRequiredRoundsExceeded { max_rounds })
+    }
+
+    /// High-level `resources/read` helper that automatically fulfils SEP-2322
+    /// `input_required` rounds through the local [`ClientHandler`](crate::ClientHandler) service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InputRequiredRoundsExceeded`] if the peer does
+    /// not produce a final [`ReadResourceResult`] within the default MRTR round
+    /// cap. Other transport, protocol, and local input-handler errors are
+    /// propagated.
+    pub async fn read_resource(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResult, ServiceError> {
+        self.read_resource_with_mrtr_max_rounds(params, DEFAULT_MRTR_MAX_ROUNDS)
+            .await
+    }
+
+    /// Same as [`Self::read_resource`], with an explicit MRTR round cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InputRequiredRoundsExceeded`] once `max_rounds`
+    /// `input_required` responses have been driven without receiving a final
+    /// [`ReadResourceResult`]. Other transport, protocol, and local input-handler
+    /// errors are propagated.
+    pub async fn read_resource_with_mrtr_max_rounds(
+        &self,
+        mut params: ReadResourceRequestParams,
+        max_rounds: usize,
+    ) -> Result<ReadResourceResult, ServiceError> {
+        let mut state_only_rounds = 0usize;
+        for _round in 0..max_rounds {
+            match self.peer.read_resource_once(params.clone()).await? {
+                ReadResourceResponse::Complete(result) => return Ok(result),
+                ReadResourceResponse::InputRequired(result) => {
+                    let (input_responses, request_state) = self
+                        .prepare_input_required_retry(result, &mut state_only_rounds)
+                        .await?;
+                    params.input_responses = input_responses;
+                    params.request_state = request_state;
+                }
+            }
+        }
+        Err(ServiceError::InputRequiredRoundsExceeded { max_rounds })
+    }
+
+    async fn prepare_input_required_retry(
+        &self,
+        result: InputRequiredResult,
+        state_only_rounds: &mut usize,
+    ) -> Result<(Option<InputResponses>, Option<String>), ServiceError> {
+        let had_input_requests = result
+            .input_requests
+            .as_ref()
+            .is_some_and(|requests| !requests.is_empty());
+        if !had_input_requests && result.request_state.is_none() {
+            return Err(ServiceError::UnexpectedResponse);
+        }
+
+        let responses = self
+            .fulfill_input_requests(result.input_requests.unwrap_or_default())
+            .await?;
+        if had_input_requests {
+            *state_only_rounds = 0;
+        } else {
+            Self::sleep_state_only_round(*state_only_rounds).await;
+            *state_only_rounds += 1;
+        }
+
+        Ok((
+            (!responses.is_empty()).then_some(responses),
+            result.request_state,
+        ))
+    }
+
+    async fn fulfill_input_requests(
+        &self,
+        requests: crate::model::InputRequests,
+    ) -> Result<InputResponses, ServiceError> {
+        let responses = futures::future::try_join_all(
+            requests
+                .into_iter()
+                .map(|(key, request)| self.fulfill_input_request(key, request)),
+        )
+        .await?;
+        Ok(responses.into_iter().collect())
+    }
+
+    async fn fulfill_input_request(
+        &self,
+        key: String,
+        request: InputRequest,
+    ) -> Result<(String, serde_json::Value), ServiceError> {
+        let response = match request {
+            InputRequest::CreateMessage(request) => {
+                let mut request = ServerRequest::CreateMessageRequest(request);
+                let context = self.input_request_context(&key, &mut request);
+                match self
+                    .service
+                    .handle_request(request, context)
+                    .await
+                    .map_err(ServiceError::McpError)?
+                {
+                    ClientResult::CreateMessageResult(result) => {
+                        serde_json::to_value(result).map_err(Self::serde_to_service_error)?
+                    }
+                    _ => return Err(ServiceError::UnexpectedResponse),
+                }
+            }
+            InputRequest::Elicitation(request) => {
+                let mut request = ServerRequest::ElicitRequest(request);
+                let context = self.input_request_context(&key, &mut request);
+                match self
+                    .service
+                    .handle_request(request, context)
+                    .await
+                    .map_err(ServiceError::McpError)?
+                {
+                    ClientResult::ElicitResult(result) => {
+                        serde_json::to_value(result).map_err(Self::serde_to_service_error)?
+                    }
+                    _ => return Err(ServiceError::UnexpectedResponse),
+                }
+            }
+            InputRequest::ListRoots(request) => {
+                let mut request = ServerRequest::ListRootsRequest(request);
+                let context = self.input_request_context(&key, &mut request);
+                match self
+                    .service
+                    .handle_request(request, context)
+                    .await
+                    .map_err(ServiceError::McpError)?
+                {
+                    ClientResult::ListRootsResult(result) => {
+                        serde_json::to_value(result).map_err(Self::serde_to_service_error)?
+                    }
+                    _ => return Err(ServiceError::UnexpectedResponse),
+                }
+            }
+        };
+        Ok((key, response))
+    }
+
+    fn input_request_context<T>(&self, key: &str, request: &mut T) -> RequestContext<RoleClient>
+    where
+        T: GetMeta<Metadata = crate::model::RequestMetaObject> + GetExtensions,
+    {
+        let mut meta = Default::default();
+        let mut extensions = Default::default();
+        std::mem::swap(&mut meta, request.get_meta_mut());
+        std::mem::swap(&mut extensions, request.extensions_mut());
+        RequestContext {
+            ct: tokio_util::sync::CancellationToken::new(),
+            id: NumberOrString::String(Arc::from(key)),
+            peer: self.peer.clone(),
+            meta,
+            extensions,
+        }
+    }
+
+    async fn sleep_state_only_round(state_only_rounds: usize) {
+        let millis = (50u64.saturating_mul(1_u64 << state_only_rounds.min(3))).min(250);
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+    }
+
+    fn serde_to_service_error(error: serde_json::Error) -> ServiceError {
+        ServiceError::McpError(ErrorData::internal_error(
+            format!("failed to serialize MRTR input response: {error}"),
+            None,
+        ))
     }
 }

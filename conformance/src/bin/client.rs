@@ -1,5 +1,5 @@
 use rmcp::{
-    ClientHandler, ErrorData, RoleClient, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, ErrorData, RoleClient, ServiceExt,
     model::*,
     service::RequestContext,
     transport::{
@@ -14,7 +14,16 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // ─── Context parsed from MCP_CONFORMANCE_CONTEXT ────────────────────────────
 
 #[derive(Debug, Default, serde::Deserialize)]
+struct ConformanceToolCall {
+    name: String,
+    #[serde(default)]
+    arguments: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
 struct ConformanceContext {
+    #[serde(default)]
+    tool_calls: Vec<ConformanceToolCall>,
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
@@ -180,6 +189,7 @@ impl ClientHandler for FullClientHandler {
 
 const CIMD_CLIENT_METADATA_URL: &str = "https://conformance-test.local/client-metadata.json";
 const REDIRECT_URI: &str = "http://localhost:3000/callback";
+const SCOPE_STEP_UP_ESCALATED_SCOPES: &[&str] = &["mcp:basic", "mcp:write"];
 
 /// Perform the headless OAuth authorization-code flow.
 ///
@@ -365,13 +375,10 @@ async fn run_auth_scope_step_up_client(
                 // Drop old client, re-auth with upgraded scopes
                 client.cancel().await.ok();
 
-                // Re-do the full flow; the server will give us the right scopes
-                // on the second authorization request.
                 let mut oauth2 = OAuthState::new(server_url, None).await?;
-                // Pass the escalated scope hint
                 oauth2
                     .start_authorization_with_metadata_url(
-                        &[],
+                        SCOPE_STEP_UP_ESCALATED_SCOPES,
                         REDIRECT_URI,
                         Some("conformance-client"),
                         Some(CIMD_CLIENT_METADATA_URL),
@@ -387,7 +394,9 @@ async fn run_auth_scope_step_up_client(
                     )
                     .await?;
 
-                let am2 = oauth2.into_authorization_manager().unwrap();
+                let am2 = oauth2.into_authorization_manager().ok_or_else(|| {
+                    anyhow::anyhow!("Missing authorization manager after step-up")
+                })?;
                 let auth_client2 = AuthClient::new(reqwest::Client::default(), am2);
                 let transport2 = StreamableHttpClientTransport::with_client(
                     auth_client2,
@@ -435,7 +444,9 @@ async fn run_auth_scope_retry_limit_client(
             )
             .await?;
 
-        let am = oauth.into_authorization_manager().unwrap();
+        let am = oauth
+            .into_authorization_manager()
+            .ok_or_else(|| anyhow::anyhow!("Missing authorization manager"))?;
         let auth_client = AuthClient::new(reqwest::Client::default(), am);
         let transport = StreamableHttpClientTransport::with_client(
             auth_client,
@@ -443,7 +454,18 @@ async fn run_auth_scope_retry_limit_client(
         );
 
         let client = BasicClientHandler.serve(transport).await?;
-        let tools = client.list_tools(Default::default()).await?;
+        let tools = match client.list_tools(Default::default()).await {
+            Ok(tools) => tools,
+            Err(err) => {
+                tracing::info!(
+                    "Scope retry limit scenario stopped after authorization attempt {}: {}",
+                    attempt + 1,
+                    err
+                );
+                client.cancel().await.ok();
+                return Ok(());
+            }
+        };
 
         let mut got_403 = false;
         for tool in &tools.tools {
@@ -467,7 +489,7 @@ async fn run_auth_scope_retry_limit_client(
         attempt += 1;
         if attempt >= max_retries {
             tracing::info!("Reached retry limit ({max_retries}), giving up");
-            return Err(anyhow::anyhow!("Scope retry limit reached"));
+            return Ok(());
         }
     }
     Ok(())
@@ -658,7 +680,7 @@ fn openssl_free_ec_sign(pem: &str, client_id: &str, audience: &str) -> anyhow::R
     let signing_input = format!("{}.{}", header, payload);
 
     // Sign with p256
-    let secret_key = p256::ecdsa::SigningKey::from_bytes(raw_key.as_slice().into())
+    let secret_key = p256::ecdsa::SigningKey::from_slice(raw_key.as_slice())
         .map_err(|e| anyhow::anyhow!("Invalid EC key: {}", e))?;
     use p256::ecdsa::signature::Signer;
     let sig: p256::ecdsa::Signature = secret_key.sign(signing_input.as_bytes());
@@ -780,16 +802,29 @@ async fn run_basic_client(server_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_tools_call_client(server_url: &str) -> anyhow::Result<()> {
+async fn run_tools_call_client(server_url: &str, ctx: &ConformanceContext) -> anyhow::Result<()> {
     let transport = StreamableHttpClientTransport::from_uri(server_url);
     let client = FullClientHandler.serve(transport).await?;
     let tools = client.list_tools(Default::default()).await?;
-    for tool in &tools.tools {
-        let args = build_tool_arguments(tool);
-        let _ = client
-            .call_tool(call_tool_params(tool.name.clone(), args))
-            .await?;
+
+    if ctx.tool_calls.is_empty() {
+        for tool in &tools.tools {
+            let args = build_tool_arguments(tool);
+            client
+                .call_tool(call_tool_params(tool.name.clone(), args))
+                .await?;
+        }
+    } else {
+        for tool_call in &ctx.tool_calls {
+            client
+                .call_tool(call_tool_params(
+                    tool_call.name.clone().into(),
+                    tool_call.arguments.clone(),
+                ))
+                .await?;
+        }
     }
+
     client.cancel().await?;
     Ok(())
 }
@@ -806,6 +841,42 @@ async fn run_elicitation_defaults_client(server_url: &str) -> anyhow::Result<()>
         let _ = client
             .call_tool(call_tool_params(tool.name.clone(), None))
             .await?;
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+fn conformance_protocol_version() -> ProtocolVersion {
+    std::env::var("MCP_CONFORMANCE_PROTOCOL_VERSION")
+        .ok()
+        .and_then(|version| serde_json::from_value(Value::String(version)).ok())
+        .unwrap_or(ProtocolVersion::V_2026_07_28)
+}
+
+/// Runs draft stateless scenarios through the public discover lifecycle and
+/// Streamable HTTP transport.
+async fn run_discover_client(server_url: &str) -> anyhow::Result<()> {
+    let mut preferred_versions = vec![conformance_protocol_version()];
+    for version in ProtocolVersion::KNOWN_VERSIONS.iter().rev() {
+        if !preferred_versions.contains(version) {
+            preferred_versions.push(version.clone());
+        }
+    }
+    let transport = StreamableHttpClientTransport::from_uri(server_url);
+    let client = FullClientHandler
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover { preferred_versions },
+        )
+        .await?;
+
+    let tools = client.list_tools(Default::default()).await?;
+    tracing::debug!("Listed {} tools", tools.tools.len());
+    for tool in &tools.tools {
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool.name.clone()))
+            .await;
+        tracing::debug!("Called {}: {:?}", tool.name, result.is_ok());
     }
     client.cancel().await?;
     Ok(())
@@ -851,11 +922,18 @@ async fn main() -> anyhow::Result<()> {
     match scenario.as_str() {
         // Non-auth scenarios
         "initialize" => run_basic_client(&server_url).await?,
-        "tools_call" => run_tools_call_client(&server_url).await?,
+        "json-schema-ref-no-deref" => run_discover_client(&server_url).await?,
+        "tools_call" => run_tools_call_client(&server_url, &ctx).await?,
         "elicitation-sep1034-client-defaults" => {
             run_elicitation_defaults_client(&server_url).await?
         }
         "sse-retry" => run_sse_retry_client(&server_url).await?,
+        "request-metadata" | "sep-2322-client-request-state" => {
+            run_discover_client(&server_url).await?
+        }
+        "http-standard-headers" | "http-custom-headers" | "http-invalid-tool-headers" => {
+            run_tools_call_client(&server_url, &ctx).await?
+        }
 
         // Auth scenarios - standard OAuth flow
         "auth/metadata-default"
@@ -903,16 +981,7 @@ async fn main() -> anyhow::Result<()> {
             run_cross_app_access_client(&server_url, &ctx).await?
         }
 
-        _ => {
-            tracing::warn!("Unknown scenario '{}', trying auth flow", scenario);
-            match run_auth_client(&server_url, &ctx).await {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("Auth flow failed for unknown scenario: {e}");
-                    run_basic_client(&server_url).await?
-                }
-            }
-        }
+        unknown => anyhow::bail!("Unsupported conformance scenario: {unknown}"),
     }
 
     Ok(())

@@ -20,10 +20,13 @@ pub use handler::client::ClientHandler;
 pub use handler::server::ServerHandler;
 #[cfg(feature = "server")]
 pub use handler::server::wrapper::{Json, JsonAndArtifact};
+#[cfg(feature = "client")]
+pub use service::{
+    ClientLifecycleMode, ClientServiceExt, RoleClient, select_protocol_version, serve_client,
+    serve_client_with_lifecycle,
+};
 #[cfg(any(feature = "client", feature = "server"))]
 pub use service::{Peer, Service, ServiceError, ServiceExt};
-#[cfg(feature = "client")]
-pub use service::{RoleClient, serve_client};
 #[cfg(feature = "server")]
 pub use service::{RoleServer, serve_server};
 
@@ -38,7 +41,7 @@ pub mod transport;
 pub use pastey::paste;
 #[cfg(all(feature = "macros", feature = "server"))]
 pub use rmcp_macros::*;
-#[cfg(any(feature = "server", feature = "schemars"))]
+#[cfg(feature = "schemars")]
 pub use schemars;
 #[cfg(feature = "macros")]
 pub use serde;
