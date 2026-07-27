@@ -1,10 +1,17 @@
 #![allow(deprecated)]
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::*,
-    service::RequestContext,
+    service::{RequestContext, SubscriptionContext, SubscriptionSink},
+    task_manager::{TaskExit, TaskManager, TaskOptions},
     transport::{
         StreamableHttpServerConfig, StreamableHttpService,
         streamable_http_server::session::local::LocalSessionManager,
@@ -48,19 +55,111 @@ const REQUEST_STATE_KEY: &[u8] = b"rust-sdk-conformance-request-state-key!!";
 
 #[derive(Clone)]
 struct ConformanceServer {
-    subscriptions: Arc<Mutex<HashSet<String>>>,
+    legacy_resource_subscriptions: Arc<Mutex<HashSet<String>>>,
+    subscriptions: Arc<Mutex<HashMap<u64, SubscriptionSink>>>,
+    next_subscription: Arc<AtomicU64>,
     log_level: Arc<Mutex<LoggingLevel>>,
     request_state_codec: RequestStateCodec,
+    tasks: TaskManager,
 }
 
 impl ConformanceServer {
     fn new() -> Self {
         Self {
-            subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            legacy_resource_subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            next_subscription: Arc::new(AtomicU64::new(0)),
             log_level: Arc::new(Mutex::new(LoggingLevel::Debug)),
             request_state_codec: RequestStateCodec::new(REQUEST_STATE_KEY),
+            tasks: TaskManager::new(),
         }
     }
+}
+
+// ─── SEP-2663 Tasks extension fixtures ──────────────────────────────────────
+
+/// Fixture tools required by the Tasks extension conformance scenarios.
+const TASK_FIXTURE_TOOLS: &[&str] = &[
+    "greet",
+    "slow_compute",
+    "failing_job",
+    "protocol_error_job",
+    "confirm_delete",
+    "multi_input",
+    "test_tool_with_task",
+];
+
+/// Tools that are registered as task-supporting. `greet` is deliberately
+/// sync-only.
+const TASK_SUPPORTING_TOOLS: &[&str] = &[
+    "slow_compute",
+    "failing_job",
+    "protocol_error_job",
+    "confirm_delete",
+    "multi_input",
+    "test_tool_with_task",
+];
+
+/// Tools that cannot be serviced without returning a `CreateTaskResult`:
+/// calling them from a client that did not declare the tasks extension is
+/// rejected with -32021 before the tool body runs (SEP-2663 §Required
+/// Capabilities). `failing_job` and `test_tool_with_task` are registered
+/// this way for the required-task-error and MRTR-composition scenarios;
+/// `confirm_delete` and `multi_input` must park on in-task elicitation, so
+/// they have no synchronous fallback either.
+const TASK_REQUIRED_TOOLS: &[&str] = &[
+    "failing_job",
+    "test_tool_with_task",
+    "confirm_delete",
+    "multi_input",
+];
+
+fn task_fixture_tool(name: &str) -> Tool {
+    let (description, schema) = match name {
+        "greet" => (
+            "Sync-only greeting fixture (SEP-2663)",
+            json!({
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }),
+        ),
+        "slow_compute" => (
+            "Task-supporting fixture: sleeps `seconds` then returns a result (SEP-2663)",
+            json!({
+                "type": "object",
+                "properties": {
+                    "seconds": { "type": "number" },
+                    "label": { "type": "string" }
+                }
+            }),
+        ),
+        "failing_job" => (
+            "Task-supporting fixture (task support: required): returns a tool execution error (SEP-2663)",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        "protocol_error_job" => (
+            "Task-supporting fixture: fails with a protocol-level error (SEP-2663)",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        "confirm_delete" => (
+            "Task-supporting fixture: parks on a single elicitation inputRequest (SEP-2663)",
+            json!({
+                "type": "object",
+                "properties": { "filename": { "type": "string" } }
+            }),
+        ),
+        "multi_input" => (
+            "Task-supporting fixture: parks on two parallel elicitation inputRequests (SEP-2663)",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        "test_tool_with_task" => (
+            "MRTR round 1 gathers user_name, round 2 escalates to a task (SEP-2663 composition)",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        other => panic!("unknown task fixture tool: {other}"),
+    };
+    Tool::new(name.to_string(), description, json_object(schema))
 }
 
 // ─── SEP-2322 MRTR (InputRequiredResult) helpers ────────────────────────────
@@ -106,6 +205,228 @@ fn mrtr_response<'a>(
 impl ConformanceServer {
     fn mrtr_tampered_state_error() -> ErrorData {
         ErrorData::invalid_params("requestState failed integrity verification", None)
+    }
+
+    /// SEP-2663 task fixture tools. The server decides per request whether to
+    /// materialize a task: task-supporting tools create one when the client
+    /// declared the tasks extension capability; otherwise they fall through to
+    /// synchronous execution (except task-*required* tools, which reject with
+    /// -32021).
+    async fn call_task_fixture_tool(
+        &self,
+        request: CallToolRequestParams,
+        cx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let client_supports_tasks = cx
+            .client_capabilities()
+            .is_some_and(|caps| caps.supports_tasks());
+        let name = request.name.as_ref();
+        let args = request.arguments.clone().unwrap_or_default();
+
+        if TASK_REQUIRED_TOOLS.contains(&name) && !client_supports_tasks {
+            // SEP-2663 §Required Capabilities: this tool cannot be serviced
+            // without returning CreateTaskResult.
+            return Err(ErrorData::missing_required_client_capability(
+                ClientCapabilities::builder().enable_tasks().build(),
+            ));
+        }
+
+        let create_task = client_supports_tasks && TASK_SUPPORTING_TOOLS.contains(&name);
+
+        match name {
+            "greet" => {
+                let who = args.get("name").and_then(Value::as_str).unwrap_or("friend");
+                Ok(
+                    CallToolResult::success(vec![ContentBlock::text(format!("Hello, {who}!"))])
+                        .into(),
+                )
+            }
+
+            "slow_compute" => {
+                let seconds = args.get("seconds").and_then(Value::as_f64).unwrap_or(1.0);
+                let label = args
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("compute")
+                    .to_string();
+                if create_task {
+                    // The lifecycle scenario requires slow_compute to settle
+                    // to `cancelled` when tasks/cancel arrives while running;
+                    // cancellation is cooperative, so honor it explicitly.
+                    let task = self.tasks.spawn(TaskOptions::default(), move |ctx| {
+                        Box::pin(async move {
+                            tokio::select! {
+                                _ = ctx.cancelled() => Err(TaskExit::Cancelled),
+                                _ = tokio::time::sleep(
+                                    std::time::Duration::from_secs_f64(seconds),
+                                ) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                                    format!("slow_compute({label}) done after {seconds}s"),
+                                )])),
+                            }
+                        })
+                    });
+                    Ok(CreateTaskResult::new(task).into())
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "slow_compute({label}) done after {seconds}s"
+                    ))])
+                    .into())
+                }
+            }
+
+            "failing_job" => {
+                // Tool execution error: surfaces as status "completed" with
+                // result.isError = true when run as a task.
+                let work = || async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "failing_job: intentional tool execution error",
+                    )]))
+                };
+                if create_task {
+                    let task = self.tasks.spawn(TaskOptions::default(), move |_ctx| {
+                        Box::pin(async move { work().await.map_err(TaskExit::Error) })
+                    });
+                    Ok(CreateTaskResult::new(task).into())
+                } else {
+                    Ok(work().await?.into())
+                }
+            }
+
+            "protocol_error_job" => {
+                // Protocol-level failure: surfaces as status "failed" with an
+                // inlined `error` object when run as a task.
+                let work = || async {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Err(ErrorData::internal_error(
+                        "protocol_error_job: intentional protocol-level failure",
+                        None,
+                    ))
+                };
+                if create_task {
+                    let task = self.tasks.spawn(TaskOptions::default(), move |_ctx| {
+                        Box::pin(async move { work().await.map_err(TaskExit::Error) })
+                    });
+                    Ok(CreateTaskResult::new(task).into())
+                } else {
+                    work().await.map(CallToolResponse::from)
+                }
+            }
+
+            "confirm_delete" => {
+                let filename = args
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file.txt")
+                    .to_string();
+                let task = self.tasks.spawn(TaskOptions::default(), move |ctx| {
+                    Box::pin(async move {
+                        let response = ctx
+                            .request_input(
+                                "confirm",
+                                mrtr_elicitation_request(
+                                    &format!("Delete {filename}?"),
+                                    json!({ "confirm": { "type": "boolean" } }),
+                                    json!(["confirm"]),
+                                ),
+                            )
+                            .await?;
+                        let confirmed = response
+                            .get("content")
+                            .and_then(|c| c.get("confirm"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "confirm_delete({filename}): confirmed = {confirmed}"
+                        ))]))
+                    })
+                });
+                Ok(CreateTaskResult::new(task).into())
+            }
+
+            "multi_input" => {
+                let task = self.tasks.spawn(TaskOptions::default(), move |ctx| {
+                    Box::pin(async move {
+                        // Fan out two elicitation requests in parallel so two
+                        // keys are pending at once (partial fulfillment check).
+                        let first = ctx.request_input(
+                            "input-a",
+                            mrtr_elicitation_request(
+                                "Provide value A",
+                                json!({ "value": { "type": "string" } }),
+                                json!(["value"]),
+                            ),
+                        );
+                        let second = ctx.request_input(
+                            "input-b",
+                            mrtr_elicitation_request(
+                                "Provide value B",
+                                json!({ "value": { "type": "string" } }),
+                                json!(["value"]),
+                            ),
+                        );
+                        let (a, b) = tokio::join!(first, second);
+                        let (a, b) = (a?, b?);
+                        let get = |v: &Value| {
+                            v.get("content")
+                                .and_then(|c| c.get("value"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("(none)")
+                                .to_string()
+                        };
+                        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "multi_input: a = {}, b = {}",
+                            get(&a),
+                            get(&b)
+                        ))]))
+                    })
+                });
+                Ok(CreateTaskResult::new(task).into())
+            }
+
+            "test_tool_with_task" => {
+                // SEP-2663 MRTR → Tasks composition. Round 1 (no inputResponses)
+                // is a plain MRTR InputRequiredResult; round 2 escalates to a
+                // task whose result reflects the gathered user_name.
+                match mrtr_response(request.input_responses.as_ref(), "user_name") {
+                    None => {
+                        let mut requests = InputRequests::new();
+                        requests.insert(
+                            "user_name".into(),
+                            mrtr_elicitation_request(
+                                "What is your name?",
+                                json!({ "name": { "type": "string" } }),
+                                json!(["name"]),
+                            ),
+                        );
+                        Ok(InputRequiredResult::from_input_requests(requests).into())
+                    }
+                    Some(response) => {
+                        let user_name = response
+                            .get("content")
+                            .and_then(|c| c.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("friend")
+                            .to_string();
+                        let task = self.tasks.spawn(TaskOptions::default(), move |_ctx| {
+                            Box::pin(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                    "Hello, {user_name}! (async)"
+                                ))]))
+                            })
+                        });
+                        Ok(CreateTaskResult::new(task).into())
+                    }
+                }
+            }
+
+            other => Err(ErrorData::invalid_params(
+                format!("Unknown task fixture tool: {other}"),
+                None,
+            )),
+        }
     }
 
     /// SEP-2322 test tools. Each returns an `InputRequiredResult` until the
@@ -379,26 +700,81 @@ impl ServerHandler for ConformanceServer {
         (name == "test_custom_header").then(custom_header_tool)
     }
 
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_prompts()
+                .enable_prompts_list_changed()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .enable_resources_list_changed()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .enable_logging()
+                .enable_tasks()
+                .build(),
+        )
+        .with_server_info(Implementation::new("rust-conformance-server", "0.1.0"))
+        .with_instructions("Rust MCP conformance test server")
+    }
+
     async fn initialize(
         &self,
         request: InitializeRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        Ok(InitializeResult::new(
-            ServerCapabilities::builder()
-                .enable_prompts()
-                .enable_resources()
-                .enable_tools()
-                .enable_logging()
-                .build(),
-        )
-        .with_protocol_version(request.protocol_version)
-        .with_server_info(Implementation::new("rust-conformance-server", "0.1.0"))
-        .with_instructions("Rust MCP conformance test server"))
+        let info = self.get_info();
+        Ok(InitializeResult::new(info.capabilities)
+            .with_protocol_version(request.protocol_version)
+            .with_server_info(info.server_info)
+            .with_instructions(info.instructions.unwrap_or_default()))
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(requested.supported_by(&self.get_info().capabilities))
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let key = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        self.subscriptions
+            .lock()
+            .await
+            .insert(key, context.sink().clone());
+        context.cancelled().await;
+        self.subscriptions.lock().await.remove(&key);
+        Ok(())
     }
 
     async fn ping(&self, _cx: RequestContext<RoleServer>) -> Result<(), ErrorData> {
         Ok(())
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        Ok(GetTaskResult::new(self.tasks.get_task(&request.task_id)?))
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.tasks.cancel_task(&request.task_id)
     }
 
     async fn list_tools(
@@ -517,6 +893,7 @@ impl ServerHandler for ConformanceServer {
                     "type": "object",
                     "$defs": {
                         "address": {
+                            "$anchor": "address",
                             "type": "object",
                             "properties": {
                                 "street": { "type": "string" },
@@ -528,6 +905,19 @@ impl ServerHandler for ConformanceServer {
                         "name": { "type": "string" },
                         "address": { "$ref": "#/$defs/address" }
                     },
+                    "allOf": [{
+                        "anyOf": [
+                            { "required": ["name"] },
+                            { "required": ["address"] }
+                        ]
+                    }],
+                    "if": { "required": ["address"] },
+                    "then": {
+                        "properties": {
+                            "address": { "required": ["street"] }
+                        }
+                    },
+                    "else": { "required": ["name"] },
                     "additionalProperties": false
                 })),
             ),
@@ -540,6 +930,46 @@ impl ServerHandler for ConformanceServer {
                 })),
             ),
             custom_header_tool(),
+            Tool::new(
+                "test_trigger_tool_change",
+                "Triggers a tools/list_changed notification on matching subscriptions",
+                json_object(json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
+            Tool::new(
+                "test_trigger_prompt_change",
+                "Triggers a prompts/list_changed notification on matching subscriptions",
+                json_object(json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
+            Tool::new(
+                "test_missing_capability",
+                "Requires the sampling client capability",
+                json_object(json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
+            Tool::new(
+                "test_streaming_elicitation",
+                "Returns an input_required result containing an elicitation request",
+                json_object(json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
+            Tool::new(
+                "test_logging_tool",
+                "Emits notifications/message only when logLevel is requested",
+                json_object(json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
         ];
         // SEP-2322 MRTR test tools; all take no arguments.
         let mrtr_tools = [
@@ -585,6 +1015,11 @@ impl ServerHandler for ConformanceServer {
                     json_object(json!({ "type": "object", "properties": {} })),
                 )
             }))
+            .chain(
+                TASK_FIXTURE_TOOLS
+                    .iter()
+                    .map(|name| task_fixture_tool(name)),
+            )
             .collect();
         Ok(ListToolsResult {
             tools,
@@ -601,6 +1036,9 @@ impl ServerHandler for ConformanceServer {
     ) -> Result<CallToolResponse, ErrorData> {
         if request.name.starts_with("test_input_required_result_") {
             return self.call_mrtr_tool(request, &cx.meta).await;
+        }
+        if TASK_FIXTURE_TOOLS.contains(&request.name.as_ref()) {
+            return self.call_task_fixture_tool(request, &cx).await;
         }
         let args = request.arguments.unwrap_or_default();
         let result = match request.name.as_ref() {
@@ -922,6 +1360,81 @@ impl ServerHandler for ConformanceServer {
                 )]))
             }
 
+            "test_trigger_tool_change" => {
+                let subscriptions = self
+                    .subscriptions
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for subscription in subscriptions {
+                    let _ = subscription.notify_tool_list_changed().await;
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Tool list change triggered",
+                )]))
+            }
+
+            "test_trigger_prompt_change" => {
+                let subscriptions = self
+                    .subscriptions
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for subscription in subscriptions {
+                    let _ = subscription.notify_prompt_list_changed().await;
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Prompt list change triggered",
+                )]))
+            }
+
+            "test_missing_capability" => {
+                let capabilities = cx.meta.client_capabilities().unwrap_or_default();
+                if capabilities.sampling.is_none() {
+                    return Err(ErrorData::missing_required_client_capability(
+                        ClientCapabilities::builder().enable_sampling().build(),
+                    ));
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Required capability declared",
+                )]))
+            }
+
+            "test_streaming_elicitation" => {
+                let mut requests = InputRequests::new();
+                requests.insert(
+                    "streaming_elicitation".into(),
+                    mrtr_elicitation_request(
+                        "Provide a value",
+                        json!({ "value": { "type": "string" } }),
+                        json!(["value"]),
+                    ),
+                );
+                return Ok(InputRequiredResult::from_input_requests(requests).into());
+            }
+
+            "test_logging_tool" => {
+                if let Some(level) = cx.meta.log_level() {
+                    let _ = cx
+                        .peer
+                        .notify_logging_message(
+                            LoggingMessageNotificationParam::new(
+                                level,
+                                json!("logLevel was requested"),
+                            )
+                            .with_logger("conformance-server"),
+                        )
+                        .await;
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Logging tool completed",
+                )]))
+            }
+
             _ => Err(ErrorData::invalid_params(
                 format!("Unknown tool: {}", request.name),
                 None,
@@ -1029,7 +1542,7 @@ impl ServerHandler for ConformanceServer {
         request: SubscribeRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let mut subs = self.subscriptions.lock().await;
+        let mut subs = self.legacy_resource_subscriptions.lock().await;
         subs.insert(request.uri.to_string());
         Ok(())
     }
@@ -1039,7 +1552,7 @@ impl ServerHandler for ConformanceServer {
         request: UnsubscribeRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let mut subs = self.subscriptions.lock().await;
+        let mut subs = self.legacy_resource_subscriptions.lock().await;
         subs.remove(request.uri.as_str());
         Ok(())
     }
@@ -1229,7 +1742,7 @@ async fn main() -> anyhow::Result<()> {
     let server = ConformanceServer::new();
     let stateless = std::env::var_os("STATELESS").is_some();
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(!stateless)
+        .with_legacy_session_mode(!stateless)
         .with_json_response(stateless);
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),

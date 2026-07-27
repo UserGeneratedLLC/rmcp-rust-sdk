@@ -1,6 +1,6 @@
 # Model Context Protocol OAuth Authorization
 
-This document describes the OAuth 2.1 authorization implementation for Model Context Protocol (MCP), following the [MCP 2025-11-25 Authorization Specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization/).
+This document describes the OAuth 2.1 authorization implementation for Model Context Protocol (MCP), following the [MCP Authorization Specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/).
 
 ## Features
 
@@ -108,16 +108,76 @@ Use this path when OAuth traffic must go through a browser fetch API, a remote
 execution environment, a company gateway, a test fake, or any other non-reqwest
 transport.
 
-### 3. Start authorization with OAuthState
+#### Inspect discovery provenance directly
 
-The `OAuthState` state machine manages the full authorization lifecycle. When no
-scopes are provided, the SDK automatically selects scopes from the server's
-WWW-Authenticate header, Protected Resource Metadata, or AS metadata.
+Most applications can use `OAuthState` without calling metadata discovery
+directly. When using `AuthorizationManager`, `resolve_metadata()` returns both
+the metadata and how it was obtained. A client that supports the 2025-03-26
+default-endpoint fallback can continue with synthesized metadata, while a
+client that requires server-published metadata should reject that result:
 
 ```rust ignore
-// start authorization - pass empty scopes to let the SDK auto-select
+use rmcp::transport::auth::{AuthorizationManager, AuthorizationMetadataSource};
+
+async fn configure_metadata(
+    manager: &mut AuthorizationManager,
+    allow_legacy_endpoint_fallback: bool,
+) -> anyhow::Result<()> {
+    let resolution = manager.resolve_metadata().await?;
+
+    if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+        if !allow_legacy_endpoint_fallback {
+            anyhow::bail!("the server did not publish OAuth metadata");
+        }
+
+        tracing::warn!(
+            "the server did not publish OAuth metadata; using the 2025-03-26 fallback endpoints"
+        );
+    }
+
+    manager.set_metadata(resolution.metadata);
+    Ok(())
+}
+```
+
+`ProtectedResourceMetadata` and `AuthorizationServerMetadata` indicate
+server-published metadata, so clients can proceed with the returned metadata.
+`LegacyEndpointFallback` indicates endpoints synthesized for compatibility
+with the 2025-03-26 MCP specification. Clients should proceed only when they
+intentionally support that legacy behavior; clients using discovery as an
+OAuth capability check should treat it as unsupported.
+
+Applications using `OAuthState` do not need to handle these sources directly:
+the state machine resolves metadata internally and retains the legacy fallback.
+Low-level `AuthorizationManager` users can use
+`AuthorizationMetadataSource::is_discovered()` when they only need to
+distinguish server-published metadata from synthesized metadata.
+
+### 3. Start authorization with OAuthState
+
+The `OAuthState` state machine manages the full authorization lifecycle.
+`start_authorization` accepts an `AuthorizationRequest` describing the client
+identity material you have available, and selects a client registration
+mechanism following the [spec's priority order](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration):
+
+1. **Pre-registered client information** (`with_preregistered_client`), when
+   the client already holds a `client_id` issued out of band
+2. **Client ID Metadata Documents** (SEP-991, `with_client_metadata_url`), when
+   the authorization server advertises `client_id_metadata_document_supported`
+3. **Dynamic Client Registration**, as a fallback when the authorization server
+   advertises a `registration_endpoint`
+
+When no scopes are provided, the SDK automatically selects scopes from the
+server's WWW-Authenticate header, Protected Resource Metadata, or AS metadata.
+
+```rust ignore
+use rmcp::transport::auth::AuthorizationRequest;
+
+// start authorization - pass no scopes to let the SDK auto-select
 oauth_state
-    .start_authorization(&[], MCP_REDIRECT_URI, Some("My MCP Client"))
+    .start_authorization(
+        AuthorizationRequest::new(MCP_REDIRECT_URI).with_client_name("My MCP Client"),
+    )
     .await
     .context("Failed to start authorization")?;
 ```
@@ -126,7 +186,40 @@ If you know the scopes you need, you can still pass them explicitly:
 
 ```rust ignore
 oauth_state
-    .start_authorization(&["mcp", "profile"], MCP_REDIRECT_URI, Some("My MCP Client"))
+    .start_authorization(
+        AuthorizationRequest::new(MCP_REDIRECT_URI)
+            .with_scopes(["mcp", "profile"])
+            .with_client_name("My MCP Client"),
+    )
+    .await
+    .context("Failed to start authorization")?;
+```
+
+If the client hosts a Client ID Metadata Document (SEP-991), pass its URL; the
+SDK uses it when the server supports CIMD and falls back to dynamic
+registration otherwise:
+
+```rust ignore
+oauth_state
+    .start_authorization(
+        AuthorizationRequest::new(MCP_REDIRECT_URI)
+            .with_client_name("My MCP Client")
+            .with_client_metadata_url("https://example.com/client-metadata.json"),
+    )
+    .await
+    .context("Failed to start authorization")?;
+```
+
+If the client was registered with the authorization server out of band, provide
+the pre-registered credentials; they take priority over every other mechanism:
+
+```rust ignore
+oauth_state
+    .start_authorization(
+        AuthorizationRequest::new(MCP_REDIRECT_URI)
+            .with_preregistered_client("my-client-id")
+            .with_client_secret("my-client-secret"),
+    )
     .await
     .context("Failed to start authorization")?;
 ```
@@ -181,7 +274,8 @@ match oauth_state.request_scope_upgrade("admin:write", MCP_REDIRECT_URI).await {
 
 ## Complete Examples
 
-- **Client**: [`examples/clients/src/auth/oauth_client.rs`](../examples/clients/src/auth/oauth_client.rs)
+- **Authorization Code client**: [`examples/clients/src/auth/oauth_client.rs`](../examples/clients/src/auth/oauth_client.rs)
+- **Client Credentials client**: [`examples/clients/src/auth/client_credentials.rs`](../examples/clients/src/auth/client_credentials.rs)
 - **Server**: [`examples/servers/src/complex_auth_streamhttp.rs`](../examples/servers/src/complex_auth_streamhttp.rs)
 
 ### Running the Examples
@@ -192,6 +286,10 @@ cargo run -p mcp-server-examples --example servers_complex_auth_streamhttp
 
 # Run the OAuth client (in another terminal)
 cargo run -p mcp-client-examples --example clients_oauth_client
+
+# Run the Client Credentials client
+cargo run -p mcp-client-examples --example clients_client_credentials -- \
+  <server_url> <client_id> <client_secret>
 ```
 
 ## Authorization Flow Description
@@ -231,7 +329,7 @@ If you encounter authorization issues, check the following:
 
 ## References
 
-- [MCP Authorization Specification (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization/)
+- [MCP Authorization Specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/)
 - [OAuth 2.1 Specification Draft](https://oauth.net/2.1/)
 - [RFC 8414: OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414)
 - [RFC 7591: OAuth 2.0 Dynamic Client Registration Protocol](https://datatracker.ietf.org/doc/html/rfc7591)

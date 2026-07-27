@@ -11,16 +11,13 @@ use crate::common::extract_doc_line;
 /// `Content` blocks (e.g. a `resource_link`) to the tool result, but its
 /// `outputSchema` is still derived from the inner `T`.
 fn extract_json_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
-    if let syn::Type::Path(type_path) = ty {
-        if let Some(last_segment) = type_path.path.segments.last() {
-            if last_segment.ident == "Json" || last_segment.ident == "JsonAndArtifact" {
-                if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
-                    if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
-                        return Some(inner_type);
-                    }
-                }
-            }
-        }
+    if let syn::Type::Path(type_path) = ty
+        && let Some(last_segment) = type_path.path.segments.last()
+        && (last_segment.ident == "Json" || last_segment.ident == "JsonAndArtifact")
+        && let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments
+        && let Some(syn::GenericArgument::Type(inner_type)) = args.args.first()
+    {
+        return Some(inner_type);
     }
     None
 }
@@ -79,8 +76,6 @@ pub struct ToolAttribute {
     pub output_schema: Option<Expr>,
     /// Optional additional tool information.
     pub annotations: Option<ToolAnnotationsAttribute>,
-    /// Execution-related configuration including task support.
-    pub execution: Option<ToolExecutionAttribute>,
     /// Optional icons for the tool
     pub icons: Option<Expr>,
     /// Optional metadata for the tool
@@ -90,13 +85,6 @@ pub struct ToolAttribute {
     pub local: bool,
 }
 
-#[derive(FromMeta, Debug, Default)]
-#[darling(default)]
-pub struct ToolExecutionAttribute {
-    /// Task support mode: "forbidden", "optional", or "required"
-    pub task_support: Option<String>,
-}
-
 pub struct ResolvedToolAttribute {
     pub name: String,
     pub title: Option<String>,
@@ -104,7 +92,6 @@ pub struct ResolvedToolAttribute {
     pub input_schema: Expr,
     pub output_schema: Option<Expr>,
     pub annotations: Option<Expr>,
-    pub execution: Option<Expr>,
     pub icons: Option<Expr>,
     pub meta: Option<Expr>,
 }
@@ -118,7 +105,6 @@ impl ResolvedToolAttribute {
             input_schema,
             output_schema,
             annotations,
-            execution,
             icons,
             meta,
         } = self;
@@ -135,9 +121,6 @@ impl ResolvedToolAttribute {
             .unwrap_or_default();
         let annotations_call = annotations
             .map(|a| quote! { .with_annotations(#a) })
-            .unwrap_or_default();
-        let execution_call = execution
-            .map(|e| quote! { .with_execution(#e) })
             .unwrap_or_default();
         let icons_call = icons
             .map(|i| quote! { .with_icons(#i) })
@@ -156,7 +139,6 @@ impl ResolvedToolAttribute {
                 #title_call
                 #output_schema_call
                 #annotations_call
-                #execution_call
                 #icons_call
                 #meta_call
             }
@@ -268,38 +250,6 @@ pub fn tool(attr: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
     } else {
         None
     };
-    let execution_expr = if let Some(execution) = attribute.execution {
-        let ToolExecutionAttribute { task_support } = execution;
-
-        let task_support_expr = if let Some(ts) = task_support {
-            let ts_ident = match ts.as_str() {
-                "forbidden" => quote! { rmcp::model::TaskSupport::Forbidden },
-                "optional" => quote! { rmcp::model::TaskSupport::Optional },
-                "required" => quote! { rmcp::model::TaskSupport::Required },
-                _ => {
-                    return Err(syn::Error::new(
-                        Span::call_site(),
-                        format!(
-                            "Invalid task_support value '{}'. Expected 'forbidden', 'optional', or 'required'",
-                            ts
-                        ),
-                    ));
-                }
-            };
-            quote! { Some(#ts_ident) }
-        } else {
-            quote! { None }
-        };
-
-        let token_stream = quote! {
-            rmcp::model::ToolExecution::from_raw(
-                #task_support_expr,
-            )
-        };
-        Some(syn::parse2::<Expr>(token_stream)?)
-    } else {
-        None
-    };
     // Handle output_schema - either explicit or generated from return type
     let output_schema_expr = attribute.output_schema.or_else(|| {
         // Try to generate schema from return type
@@ -323,7 +273,6 @@ pub fn tool(attr: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
         input_schema: input_schema_expr,
         output_schema: output_schema_expr,
         annotations: annotations_expr,
-        execution: execution_expr,
         title: attribute.title,
         icons: attribute.icons,
         meta: attribute.meta,
@@ -338,13 +287,13 @@ pub fn tool(attr: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
         let omit_send = cfg!(feature = "local") || attribute.local;
         let new_output = syn::parse2::<ReturnType>({
             let mut lt = quote! { 'static };
-            if let Some(receiver) = fn_item.sig.receiver() {
-                if let Some((_, receiver_lt)) = receiver.reference.as_ref() {
-                    if let Some(receiver_lt) = receiver_lt {
-                        lt = quote! { #receiver_lt };
-                    } else {
-                        lt = quote! { '_ };
-                    }
+            if let Some(receiver) = fn_item.sig.receiver()
+                && let Some((_, receiver_lt)) = receiver.reference.as_ref()
+            {
+                if let Some(receiver_lt) = receiver_lt {
+                    lt = quote! { #receiver_lt };
+                } else {
+                    lt = quote! { '_ };
                 }
             }
             match &fn_item.sig.output {

@@ -31,12 +31,6 @@ use crate::transport::common::http_header::HEADER_MCP_PROTOCOL_VERSION;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_OAUTH_DISCOVERY_REDIRECTS: usize = 10;
-const RESOURCE_METADATA_POST_PROBE_BODY: &str = concat!(
-    r#"{"jsonrpc":"2.0","id":"auth-discovery","method":"initialize","params":{"#,
-    r#""protocolVersion":"2024-11-05","capabilities":{},"#,
-    r#""clientInfo":{"name":"rmcp-auth-discovery","version":"0.0.0"}}"#,
-    r#"}"#
-);
 const CLOUD_METADATA_HOSTS: &[&str] = &[
     "metadata",
     "metadata.google.internal",
@@ -201,6 +195,8 @@ pub struct StoredCredentials {
     pub granted_scopes: Vec<String>,
     #[serde(default)]
     pub token_received_at: Option<u64>,
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 impl std::fmt::Debug for StoredCredentials {
@@ -213,6 +209,7 @@ impl std::fmt::Debug for StoredCredentials {
             )
             .field("granted_scopes", &self.granted_scopes)
             .field("token_received_at", &self.token_received_at)
+            .field("issuer", &self.issuer)
             .finish()
     }
 }
@@ -230,7 +227,13 @@ impl StoredCredentials {
             token_response,
             granted_scopes,
             token_received_at,
+            issuer: None,
         }
+    }
+
+    pub fn with_issuer(mut self, issuer: Option<String>) -> Self {
+        self.issuer = issuer;
+        self
     }
 }
 
@@ -569,6 +572,43 @@ pub struct AuthorizationMetadata {
     pub additional_fields: HashMap<String, serde_json::Value>,
 }
 
+/// How [`AuthorizationMetadata`] was obtained during discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthorizationMetadataSource {
+    /// Discovered through RFC 9728 protected resource metadata.
+    ProtectedResourceMetadata,
+    /// Discovered through RFC 8414 / OpenID Connect metadata at the server's
+    /// base URL.
+    AuthorizationServerMetadata,
+    /// Nothing was discovered; the endpoints were synthesized from the base
+    /// URL (`/authorize`, `/token`, `/register`) for compatibility with the
+    /// 2025-03-26 MCP spec's default-endpoint fallback. The server gave no
+    /// evidence that it supports OAuth.
+    ///
+    /// [Newer MCP revisions] require metadata discovery and do not define an
+    /// endpoint-synthesis fallback.
+    ///
+    /// [Newer MCP revisions]: https://modelcontextprotocol.io/specification/draft/basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements
+    LegacyEndpointFallback,
+}
+
+impl AuthorizationMetadataSource {
+    /// Whether the metadata was actually published by the server, as opposed
+    /// to synthesized by the client as a legacy compatibility fallback.
+    pub fn is_discovered(self) -> bool {
+        !matches!(self, Self::LegacyEndpointFallback)
+    }
+}
+
+/// [`AuthorizationMetadata`] together with how it was resolved.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AuthorizationMetadataResolution {
+    pub metadata: AuthorizationMetadata,
+    pub source: AuthorizationMetadataSource,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ResourceServerMetadata {
     resource: Option<String>,
@@ -588,6 +628,12 @@ pub struct WWWAuthenticateParams {
 }
 
 impl WWWAuthenticateParams {
+    /// Parse a `WWW-Authenticate` header value, resolving a relative
+    /// `resource_metadata` URL against `base_url`.
+    pub fn parse(header: &str, base_url: &Url) -> Self {
+        AuthorizationManager::extract_www_authenticate_params(header, base_url)
+    }
+
     /// check if this is an insufficient_scope error
     pub fn is_insufficient_scope(&self) -> bool {
         self.error.as_deref() == Some("insufficient_scope")
@@ -634,6 +680,142 @@ impl OAuthClientConfig {
     /// Set the OIDC Dynamic Client Registration `application_type` (SEP-837), e.g. `"native"` or `"web"`
     pub fn with_application_type(mut self, application_type: impl Into<String>) -> Self {
         self.application_type = Some(application_type.into());
+        self
+    }
+}
+
+/// Declarative description of the client identity material available for an
+/// authorization flow.
+///
+/// The [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+/// recommends that clients obtain a client ID using the following priority
+/// order. [`OAuthState::start_authorization`] and [`AuthorizationSession::new`]
+/// apply it internally:
+///
+/// 1. Pre-registered client information
+///    ([`with_preregistered_client`](Self::with_preregistered_client)), when
+///    the client already holds a `client_id` issued out of band
+/// 2. Client ID Metadata Documents (SEP-991,
+///    [`with_client_metadata_url`](Self::with_client_metadata_url)), when the
+///    authorization server advertises `client_id_metadata_document_supported`
+/// 3. Dynamic Client Registration as a fallback, when the authorization server
+///    advertises a `registration_endpoint`
+///
+/// Provide whichever identity material the client has available; the SDK
+/// selects the highest-priority mechanism the server supports.
+///
+/// ```rust,ignore
+/// let request = AuthorizationRequest::new("http://localhost:8080/callback")
+///     // Omit `with_scopes` to let the SDK auto-select scopes from server metadata.
+///     // Used when the server supports CIMD and no pre-registered client is set.
+///     .with_client_metadata_url("https://example.com/client-metadata.json")
+///     // used for dynamic client registration as a last resort
+///     .with_client_name("My MCP Client");
+/// oauth_state.start_authorization(request).await?;
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AuthorizationRequest {
+    /// Redirect URI for the authorization-code flow.
+    pub redirect_uri: String,
+    /// Scopes to request. When empty, the SDK selects scopes from the
+    /// server's `WWW-Authenticate` challenge, Protected Resource Metadata,
+    /// or authorization server metadata.
+    pub scopes: Vec<String>,
+    /// Human-readable client name, used for Dynamic Client Registration.
+    pub client_name: Option<String>,
+    /// Pre-registered client ID obtained from the authorization server out of
+    /// band. When set, registration is skipped entirely.
+    pub client_id: Option<String>,
+    /// Client secret paired with the pre-registered [`client_id`](Self::client_id).
+    pub client_secret: Option<String>,
+    /// HTTPS URL of a Client ID Metadata Document (SEP-991). Used when the
+    /// authorization server advertises `client_id_metadata_document_supported`
+    /// and no pre-registered client is configured.
+    pub client_metadata_url: Option<String>,
+    /// OIDC Dynamic Client Registration `application_type` (SEP-837),
+    /// e.g. `"native"` or `"web"`.
+    pub application_type: Option<String>,
+    /// `WWW-Authenticate` header value from a real request's 401 response.
+    /// When set, discovery is seeded from the challenge (its
+    /// `resource_metadata` URL and `scope` hint) instead of probing the
+    /// server — the reactive discovery path.
+    pub challenge: Option<String>,
+}
+
+impl AuthorizationRequest {
+    /// Create a request for the given redirect URI. With no further identity
+    /// material, authorization falls back to Dynamic Client Registration.
+    pub fn new(redirect_uri: impl Into<String>) -> Self {
+        Self {
+            redirect_uri: redirect_uri.into(),
+            scopes: Vec::new(),
+            client_name: None,
+            client_id: None,
+            client_secret: None,
+            client_metadata_url: None,
+            application_type: None,
+            challenge: None,
+        }
+    }
+
+    /// Set the scopes to request. When not set, the SDK auto-selects scopes
+    /// using its normal scope-selection policy.
+    pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the client name used for Dynamic Client Registration.
+    pub fn with_client_name(mut self, client_name: impl Into<String>) -> Self {
+        self.client_name = Some(client_name.into());
+        self
+    }
+
+    /// Use a client ID that was pre-registered with the authorization server
+    /// out of band. This takes priority over every other mechanism.
+    ///
+    /// Pair with [`with_client_secret`](Self::with_client_secret) for
+    /// confidential clients.
+    pub fn with_preregistered_client(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
+        self
+    }
+
+    /// Set the client secret paired with a pre-registered client ID.
+    ///
+    /// Must be used together with
+    /// [`with_preregistered_client`](Self::with_preregistered_client);
+    /// authorization fails with [`AuthError::RegistrationFailed`] if a secret
+    /// is provided without a client ID.
+    pub fn with_client_secret(mut self, client_secret: impl Into<String>) -> Self {
+        self.client_secret = Some(client_secret.into());
+        self
+    }
+
+    /// Set the HTTPS URL of a Client ID Metadata Document (SEP-991). Used when
+    /// the authorization server advertises support and no pre-registered
+    /// client is configured.
+    pub fn with_client_metadata_url(mut self, client_metadata_url: impl Into<String>) -> Self {
+        self.client_metadata_url = Some(client_metadata_url.into());
+        self
+    }
+
+    /// Set the OIDC Dynamic Client Registration `application_type` (SEP-837),
+    /// e.g. `"native"` or `"web"`.
+    pub fn with_application_type(mut self, application_type: impl Into<String>) -> Self {
+        self.application_type = Some(application_type.into());
+        self
+    }
+
+    /// Seed discovery from the `WWW-Authenticate` header value of a real
+    /// request's 401 response instead of probing the server.
+    pub fn with_challenge(mut self, www_authenticate: impl Into<String>) -> Self {
+        self.challenge = Some(www_authenticate.into());
         self
     }
 }
@@ -730,11 +912,33 @@ pub enum ClientCredentialsConfig {
         client_id: String,
         signing_key: Vec<u8>,
         signing_algorithm: JwtSigningAlgorithm,
-        /// Override the `aud` claim in the JWT assertion; defaults to token_endpoint
+        /// Overrides the authorization server issuer used for the JWT `aud` claim.
         token_endpoint_audience: Option<String>,
         scopes: Vec<String>,
         resource: Option<String>,
     },
+}
+
+#[cfg(feature = "auth-client-credentials-jwt")]
+fn client_authentication_audience<'a>(
+    metadata: &'a AuthorizationMetadata,
+    configured_audience: Option<&'a str>,
+) -> Result<&'a str, AuthError> {
+    configured_audience
+        .or(metadata.issuer.as_deref())
+        .ok_or_else(|| {
+            AuthError::ClientCredentialsError(
+                "Authorization server metadata is missing the issuer required for private_key_jwt"
+                    .to_string(),
+            )
+        })
+}
+
+#[cfg(feature = "auth-client-credentials-jwt")]
+fn client_authentication_header(algorithm: JwtSigningAlgorithm) -> jsonwebtoken::Header {
+    let mut header = jsonwebtoken::Header::new(algorithm.to_jsonwebtoken_algorithm());
+    header.typ = Some("client-authentication+jwt".to_string());
+    header
 }
 
 impl ClientCredentialsConfig {
@@ -809,6 +1013,7 @@ pub struct AuthorizationManager {
     resource_scopes: RwLock<Vec<String>>,
     /// OIDC Dynamic Client Registration `application_type` (SEP-837)
     application_type: Option<String>,
+    allow_missing_issuer: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,6 +1060,18 @@ fn is_https_url(value: &str) -> bool {
         .ok()
         .map(|url| url.scheme() == "https" && url.path() != "/" && url.host_str().is_some())
         .unwrap_or(false)
+}
+
+#[cfg(feature = "auth-client-credentials-jwt")]
+fn is_allowed_client_credentials_endpoint(resource: &Url, token_endpoint: &Url) -> bool {
+    token_endpoint.scheme() == "https"
+        || (token_endpoint.scheme() == "http"
+            && resource
+                .host_str()
+                .is_some_and(AuthorizationManager::is_loopback_metadata_host)
+            && token_endpoint
+                .host_str()
+                .is_some_and(AuthorizationManager::is_loopback_metadata_host))
 }
 
 impl AuthorizationManager {
@@ -1042,6 +1259,7 @@ impl AuthorizationManager {
             www_auth_scopes: RwLock::new(Vec::new()),
             resource_scopes: RwLock::new(Vec::new()),
             application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
+            allow_missing_issuer: false,
         };
 
         Ok(manager)
@@ -1050,6 +1268,17 @@ impl AuthorizationManager {
     /// Set the scope upgrade configuration
     pub fn set_scope_upgrade_config(&mut self, config: ScopeUpgradeConfig) {
         self.scope_upgrade_config = config;
+    }
+
+    /// Configure whether authorization server metadata discovery tolerates a
+    /// missing `issuer` field.
+    ///
+    /// The default is `false`, enforcing the RFC 8414/OIDC requirement that
+    /// discovered metadata include `issuer` whenever the expected issuer can be
+    /// derived from the discovery URL. Set this to `true` only for compatibility
+    /// with authorization servers that return incomplete metadata.
+    pub fn set_allow_missing_issuer(&mut self, allow: bool) {
+        self.allow_missing_issuer = allow;
     }
 
     /// Set a custom credential store
@@ -1070,8 +1299,10 @@ impl AuthorizationManager {
 
     /// Set OAuth2 authorization metadata
     ///
-    /// This should be called after discovering metadata via `discover_metadata()`
-    /// and before creating an `AuthorizationSession`.
+    /// This should be called with
+    /// [`AuthorizationMetadataResolution::metadata`] after
+    /// [`Self::resolve_metadata`] and before creating an
+    /// [`AuthorizationSession`].
     pub fn set_metadata(&mut self, metadata: AuthorizationMetadata) {
         self.metadata = Some(metadata);
     }
@@ -1079,18 +1310,59 @@ impl AuthorizationManager {
     /// Initialize from stored credentials if available
     ///
     /// This will load credentials from the credential store and configure
-    /// the client if credentials are found.
+    /// the client if credentials are found. Returns `false` when credentials
+    /// are absent or discarded after an authorization-server change.
     pub async fn initialize_from_store(&mut self) -> Result<bool, AuthError> {
-        if let Some(stored) = self.credential_store.load().await? {
-            if stored.token_response.is_some() {
-                if self.metadata.is_none() {
-                    let metadata = self.discover_metadata().await?;
-                    self.metadata = Some(metadata);
-                }
-
-                self.configure_client_id(&stored.client_id)?;
-                return Ok(true);
+        if let Some(stored) = self.credential_store.load().await?
+            && stored.token_response.is_some()
+        {
+            if self.metadata.is_none() {
+                let resolution = self.resolve_metadata().await?;
+                self.metadata = Some(resolution.metadata);
             }
+
+            if let (Some(stored_issuer), Some(current_issuer)) =
+                (stored.issuer.as_deref(), self.metadata_issuer().as_deref())
+            {
+                // A CIMD client ID is the client's metadata URL, so it is
+                // portable across authorization servers and exempt here.
+                if stored_issuer != current_issuer {
+                    if is_https_url(&stored.client_id) {
+                        // A CIMD client ID is the client's metadata URL, so it is
+                        // portable across authorization servers — but the tokens
+                        // were minted by the previous AS and must not be reused.
+                        tracing::warn!(
+                            stored_issuer,
+                            current_issuer,
+                            "authorization server issuer changed; discarding tokens but keeping portable CIMD client ID"
+                        );
+                        self.credential_store
+                            .save(
+                                StoredCredentials::new(
+                                    stored.client_id.clone(),
+                                    None,
+                                    vec![],
+                                    None,
+                                )
+                                .with_issuer(self.metadata_issuer()),
+                            )
+                            .await?;
+                        self.configure_client_id(&stored.client_id)?;
+                        return Ok(false);
+                    }
+
+                    tracing::warn!(
+                        stored_issuer,
+                        current_issuer,
+                        "authorization server issuer changed; clearing stored credentials bound to the previous issuer"
+                    );
+                    self.credential_store.clear().await?;
+                    return Ok(false);
+                }
+            }
+
+            self.configure_client_id(&stored.client_id)?;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -1113,18 +1385,97 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    /// discover oauth2 metadata (per SEP-985: Protected Resource Metadata first, then direct OAuth)
-    pub async fn discover_metadata(&self) -> Result<AuthorizationMetadata, AuthError> {
+    /// Resolve OAuth 2.0 metadata and report how it was obtained.
+    ///
+    /// Discovery follows SEP-985: protected resource metadata first, then
+    /// direct OAuth 2.0 Authorization Server Metadata or OpenID Connect
+    /// Discovery. When discovery finds nothing, the result contains legacy
+    /// default endpoints derived from the base URL and
+    /// [`AuthorizationMetadataSource::LegacyEndpointFallback`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rmcp::transport::auth::{AuthorizationManager, AuthorizationMetadataSource};
+    ///
+    /// # async fn resolve() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut manager = AuthorizationManager::new("https://mcp.example.com").await?;
+    /// let resolution = manager.resolve_metadata().await?;
+    ///
+    /// if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+    ///     println!("the server did not publish OAuth metadata");
+    /// }
+    ///
+    /// manager.set_metadata(resolution.metadata);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resolve_metadata(&self) -> Result<AuthorizationMetadataResolution, AuthError> {
         if let Some(metadata) = self.discover_oauth_server_via_resource_metadata().await? {
-            return Ok(metadata);
+            return Ok(AuthorizationMetadataResolution {
+                metadata,
+                source: AuthorizationMetadataSource::ProtectedResourceMetadata,
+            });
         }
 
         if let Some(metadata) = self.try_discover_oauth_server(&self.base_url).await? {
-            return Ok(metadata);
+            return Ok(AuthorizationMetadataResolution {
+                metadata,
+                source: AuthorizationMetadataSource::AuthorizationServerMetadata,
+            });
         }
 
         debug!("falling back to legacy OAuth endpoints derived from the base URL");
-        Ok(Self::legacy_authorization_metadata(&self.base_url))
+        Ok(AuthorizationMetadataResolution {
+            metadata: Self::legacy_authorization_metadata(&self.base_url),
+            source: AuthorizationMetadataSource::LegacyEndpointFallback,
+        })
+    }
+
+    /// Resolve authorization server metadata starting from the
+    /// `WWW-Authenticate` challenge of a real request's 401 response — the
+    /// reactive discovery path, matching the TypeScript and Python SDKs.
+    ///
+    /// Seeds scope selection with the challenge's `scope` hint and prefers
+    /// the challenge's `resource_metadata` URL; falls back to
+    /// [`resolve_metadata`](Self::resolve_metadata) when the challenge is
+    /// `None` or carries no usable metadata pointer.
+    pub async fn resolve_metadata_from_challenge(
+        &self,
+        www_authenticate: Option<&str>,
+    ) -> Result<AuthorizationMetadataResolution, AuthError> {
+        let Some(www_authenticate) = www_authenticate else {
+            return self.resolve_metadata().await;
+        };
+        let params = WWWAuthenticateParams::parse(www_authenticate, &self.base_url);
+
+        self.record_challenge_scope(&params).await;
+
+        if let Some(resource_metadata_url) = &params.resource_metadata_url
+            && let Some(metadata) = self
+                .discover_oauth_server_from_resource_metadata_url(resource_metadata_url)
+                .await?
+        {
+            return Ok(AuthorizationMetadataResolution {
+                metadata,
+                source: AuthorizationMetadataSource::ProtectedResourceMetadata,
+            });
+        }
+
+        self.resolve_metadata().await
+    }
+
+    /// Store a challenge's `scope` hint for later scope selection.
+    async fn record_challenge_scope(&self, params: &WWWAuthenticateParams) {
+        let Some(scope) = &params.scope else {
+            return;
+        };
+        let scopes: Vec<String> = scope.split_whitespace().map(str::to_string).collect();
+        if scopes.is_empty() {
+            return;
+        }
+        debug!("WWW-Authenticate challenge contains scope: {scope}");
+        *self.www_auth_scopes.write().await = scopes;
     }
 
     fn legacy_authorization_metadata(base_url: &Url) -> AuthorizationMetadata {
@@ -1218,10 +1569,10 @@ impl AuthorizationManager {
 
         // RFC 8414 RECOMMENDS response_types_supported in the metadata. This field is optional,
         // but if present and does not include the flow we use ("code"), bail out early with a clear error.
-        if let Some(response_types_supported) = metadata.response_types_supported.as_ref() {
-            if !response_types_supported.contains(&response_type.to_string()) {
-                return Err(AuthError::InvalidScope(response_type.to_string()));
-            }
+        if let Some(response_types_supported) = metadata.response_types_supported.as_ref()
+            && !response_types_supported.contains(&response_type.to_string())
+        {
+            return Err(AuthError::InvalidScope(response_type.to_string()));
         }
 
         // The client always sends an S256 challenge. A server that advertises
@@ -1506,12 +1857,11 @@ impl AuthorizationManager {
         }
 
         // nothing requested or challenged yet: seed from AS metadata, then caller defaults
-        if let Some(metadata) = &self.metadata {
-            if let Some(scopes_supported) = &metadata.scopes_supported {
-                if !scopes_supported.is_empty() {
-                    return scopes_supported.clone();
-                }
-            }
+        if let Some(metadata) = &self.metadata
+            && let Some(scopes_supported) = &metadata.scopes_supported
+            && !scopes_supported.is_empty()
+        {
+            return scopes_supported.clone();
         }
 
         default_scopes.iter().map(|s| s.to_string()).collect()
@@ -1523,12 +1873,11 @@ impl AuthorizationManager {
         if scopes.is_empty() || scopes.iter().any(|s| s == "offline_access") {
             return;
         }
-        if let Some(metadata) = &self.metadata {
-            if let Some(supported) = &metadata.scopes_supported {
-                if supported.iter().any(|s| s == "offline_access") {
-                    scopes.push("offline_access".to_string());
-                }
-            }
+        if let Some(metadata) = &self.metadata
+            && let Some(supported) = &metadata.scopes_supported
+            && supported.iter().any(|s| s == "offline_access")
+        {
+            scopes.push("offline_access".to_string());
         }
     }
 
@@ -1703,6 +2052,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            issuer: self.metadata_issuer(),
         };
         self.credential_store.save(stored).await?;
 
@@ -1714,6 +2064,10 @@ impl AuthorizationManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    fn metadata_issuer(&self) -> Option<String> {
+        self.metadata.as_ref().and_then(|m| m.issuer.clone())
     }
 
     /// Proactive refresh buffer: refresh tokens this many seconds before they expire
@@ -1761,7 +2115,7 @@ impl AuthorizationManager {
     /// refresh token or the server rejected it, return `AuthorizationRequired`
     /// so the caller can re-prompt the user. Infrastructure errors (e.g. store
     /// I/O failures, misconfigured client) are propagated as-is.
-    async fn try_refresh_or_reauth(&self) -> Result<String, AuthError> {
+    pub(crate) async fn try_refresh_or_reauth(&self) -> Result<String, AuthError> {
         match self.refresh_token().await {
             Ok(new_creds) => {
                 tracing::info!("Refreshed access token.");
@@ -1838,6 +2192,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            issuer: self.metadata_issuer(),
         };
         self.credential_store.save(stored).await?;
 
@@ -1943,7 +2298,7 @@ impl AuthorizationManager {
 
         match serde_json::from_slice::<AuthorizationMetadata>(response.body()) {
             Ok(metadata) => {
-                Self::validate_authorization_metadata_issuer(discovery_url, &metadata)?;
+                self.validate_authorization_metadata_issuer(discovery_url, &metadata)?;
                 Ok(Some(metadata))
             }
             Err(err) => {
@@ -2005,6 +2360,7 @@ impl AuthorizationManager {
     }
 
     fn validate_authorization_metadata_issuer(
+        &self,
         discovery_url: &Url,
         metadata: &AuthorizationMetadata,
     ) -> Result<(), AuthError> {
@@ -2014,6 +2370,9 @@ impl AuthorizationManager {
             return Ok(());
         };
         let Some(received_issuer) = metadata.issuer.as_deref() else {
+            if self.allow_missing_issuer {
+                return Ok(());
+            }
             return Err(AuthError::AuthorizationServerMissingIssuer { expected_issuer });
         };
         if !Self::issuer_identifiers_match(received_issuer, &expected_issuer) {
@@ -2028,12 +2387,19 @@ impl AuthorizationManager {
     async fn discover_oauth_server_via_resource_metadata(
         &self,
     ) -> Result<Option<AuthorizationMetadata>, AuthError> {
-        let Some(resource_metadata_url) = self.discover_resource_metadata_url().await? else {
+        let Some(resource_metadata_url) = self.discover_resource_metadata_url().await else {
             return Ok(None);
         };
+        self.discover_oauth_server_from_resource_metadata_url(&resource_metadata_url)
+            .await
+    }
 
+    async fn discover_oauth_server_from_resource_metadata_url(
+        &self,
+        resource_metadata_url: &Url,
+    ) -> Result<Option<AuthorizationMetadata>, AuthError> {
         let Some(resource_metadata) = self
-            .fetch_resource_metadata_from_url(&resource_metadata_url)
+            .fetch_resource_metadata_from_url(resource_metadata_url)
             .await?
         else {
             return Ok(None);
@@ -2042,10 +2408,10 @@ impl AuthorizationManager {
         self.validate_resource_metadata_resource(&resource_metadata)?;
 
         // store scopes_supported from protected resource metadata for select_scopes()
-        if let Some(scopes) = resource_metadata.scopes_supported {
-            if !scopes.is_empty() {
-                *self.resource_scopes.write().await = scopes;
-            }
+        if let Some(scopes) = resource_metadata.scopes_supported
+            && !scopes.is_empty()
+        {
+            *self.resource_scopes.write().await = scopes;
         }
 
         let mut candidates = Vec::new();
@@ -2143,11 +2509,10 @@ impl AuthorizationManager {
             && Self::is_same_origin(&root_resource, &path_resource)
     }
 
-    async fn discover_resource_metadata_url(&self) -> Result<Option<Url>, AuthError> {
-        if let Ok(Some(resource_metadata_url)) =
-            self.fetch_resource_metadata_url(&self.base_url, true).await
+    async fn discover_resource_metadata_url(&self) -> Option<Url> {
+        if let Some(resource_metadata_url) = self.probe_resource_metadata_url(&self.base_url).await
         {
-            return Ok(Some(resource_metadata_url));
+            return Some(resource_metadata_url);
         }
 
         // If the primary URL doesn't use WWW-Authenticate, try oauth-protected-resource discovery.
@@ -2159,84 +2524,40 @@ impl AuthorizationManager {
             discovery_url.set_query(None);
             discovery_url.set_fragment(None);
             discovery_url.set_path(&candidate_path);
-            if let Ok(Some(resource_metadata_url)) = self
-                .fetch_resource_metadata_url(&discovery_url, false)
-                .await
+            if let Some(resource_metadata_url) =
+                self.probe_resource_metadata_url(&discovery_url).await
             {
-                return Ok(Some(resource_metadata_url));
+                return Some(resource_metadata_url);
             }
         }
 
-        Ok(None)
+        None
     }
 
-    /// Extract the resource metadata url from the WWW-Authenticate header value.
+    /// Probe `url` with a GET, extracting the resource metadata url from a
+    /// 200 (the url itself is the metadata document) or from a 401's
+    /// WWW-Authenticate header value.
     /// https://www.rfc-editor.org/rfc/rfc9728.html#name-use-of-www-authenticate-for
-    async fn fetch_resource_metadata_url(
-        &self,
-        url: &Url,
-        allow_post_probe: bool,
-    ) -> Result<Option<Url>, AuthError> {
+    async fn probe_resource_metadata_url(&self, url: &Url) -> Option<Url> {
         let response = match self.discovery_get(url).await {
             Ok(r) => r,
             Err(e) => {
                 debug!("resource metadata probe failed: {}", e);
-                return Ok(None);
+                return None;
             }
         };
 
         match response.status() {
-            StatusCode::OK => Ok(Some(url.clone())),
-            StatusCode::UNAUTHORIZED => Ok(self
-                .extract_resource_metadata_url_from_www_authenticate(&response)
-                .await),
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED if allow_post_probe => {
-                self.fetch_resource_metadata_url_with_post_probe(url).await
+            StatusCode::OK => Some(url.clone()),
+            StatusCode::UNAUTHORIZED => {
+                self.extract_resource_metadata_url_from_www_authenticate(&response)
+                    .await
             }
             status => {
                 debug!("resource metadata probe returned unexpected status: {status}");
-                Ok(None)
+                None
             }
         }
-    }
-
-    async fn fetch_resource_metadata_url_with_post_probe(
-        &self,
-        url: &Url,
-    ) -> Result<Option<Url>, AuthError> {
-        let request = oauth2::http::Request::builder()
-            .method("POST")
-            .uri(url.as_str())
-            .header(HEADER_MCP_PROTOCOL_VERSION, "2024-11-05")
-            .header(CONTENT_TYPE, "application/json")
-            .body(RESOURCE_METADATA_POST_PROBE_BODY.as_bytes().to_vec())
-            .map_err(|error| AuthError::InternalError(error.to_string()))?;
-        let response = match self
-            .http_client
-            .execute(OAuthHttpRequest::new(
-                request,
-                OAuthHttpRedirectPolicy::Stop,
-            ))
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                debug!("resource metadata POST probe failed: {}", error);
-                return Ok(None);
-            }
-        };
-
-        if response.status() != StatusCode::UNAUTHORIZED {
-            debug!(
-                "resource metadata POST probe returned unexpected status: {}",
-                response.status()
-            );
-            return Ok(None);
-        }
-
-        Ok(self
-            .extract_resource_metadata_url_from_www_authenticate(&response)
-            .await)
     }
 
     async fn extract_resource_metadata_url_from_www_authenticate(
@@ -2249,14 +2570,9 @@ impl AuthorizationManager {
                 continue;
             };
             let params = Self::extract_www_authenticate_params(value_str, &self.base_url);
-            if let Some(url) = params.resource_metadata_url {
-                if let Some(scope) = &params.scope {
-                    debug!("WWW-Authenticate header contains scope: {}", scope);
-                    let scopes: Vec<String> =
-                        scope.split_whitespace().map(|s| s.to_string()).collect();
-                    *self.www_auth_scopes.write().await = scopes;
-                }
-                parsed_url = Some(url);
+            if params.resource_metadata_url.is_some() {
+                self.record_challenge_scope(&params).await;
+                parsed_url = params.resource_metadata_url;
                 break;
             }
         }
@@ -2488,20 +2804,18 @@ impl AuthorizationManager {
         if let ClientCredentialsConfig::PrivateKeyJwt {
             signing_algorithm, ..
         } = config
-        {
-            if let Some(algs) = metadata
+            && let Some(algs) = metadata
                 .additional_fields
                 .get("token_endpoint_auth_signing_alg_values_supported")
                 .and_then(|v| v.as_array())
-            {
-                let alg_str = signing_algorithm.as_str();
-                if !algs.iter().any(|a| a.as_str() == Some(alg_str)) {
-                    let supported: Vec<&str> = algs.iter().filter_map(|a| a.as_str()).collect();
-                    return Err(AuthError::ClientCredentialsError(format!(
-                        "Authorization server does not support signing algorithm '{}'. Supported: {:?}",
-                        alg_str, supported
-                    )));
-                }
+        {
+            let alg_str = signing_algorithm.as_str();
+            if !algs.iter().any(|a| a.as_str() == Some(alg_str)) {
+                let supported: Vec<&str> = algs.iter().filter_map(|a| a.as_str()).collect();
+                return Err(AuthError::ClientCredentialsError(format!(
+                    "Authorization server does not support signing algorithm '{}'. Supported: {:?}",
+                    alg_str, supported
+                )));
             }
         }
 
@@ -2658,6 +2972,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            issuer: self.metadata_issuer(),
         };
         self.credential_store.save(stored).await?;
 
@@ -2692,22 +3007,20 @@ impl AuthorizationManager {
             .as_ref()
             .ok_or(AuthError::NoAuthorizationSupport)?;
 
-        // Validate that the token endpoint uses HTTPS before transmitting sensitive credentials.
         let token_endpoint_url = url::Url::parse(&metadata.token_endpoint).map_err(|e| {
             AuthError::ClientCredentialsError(format!(
                 "Invalid token endpoint URL in authorization metadata: {e}"
             ))
         })?;
-        if token_endpoint_url.scheme() != "https" {
+        if !is_allowed_client_credentials_endpoint(&self.base_url, &token_endpoint_url) {
             return Err(AuthError::ClientCredentialsError(
                 "Insecure token endpoint URL: HTTPS is required for client credentials flow"
                     .to_string(),
             ));
         }
 
-        let audience = token_endpoint_audience
-            .as_deref()
-            .unwrap_or(&metadata.token_endpoint);
+        let audience =
+            client_authentication_audience(metadata, token_endpoint_audience.as_deref())?;
 
         let assertion =
             Self::build_jwt_assertion(client_id, audience, signing_key, *signing_algorithm)?;
@@ -2780,6 +3093,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            issuer: self.metadata_issuer(),
         };
         self.credential_store.save(stored).await?;
 
@@ -2812,7 +3126,7 @@ impl AuthorizationManager {
             "jti": jti,
         });
 
-        let header = jsonwebtoken::Header::new(algorithm.to_jsonwebtoken_algorithm());
+        let header = client_authentication_header(algorithm);
         let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(signing_key).or_else(|_| {
             jsonwebtoken::EncodingKey::from_ec_pem(signing_key).map_err(|e| {
                 AuthError::JwtSigningError(format!("Failed to parse signing key: {}", e))
@@ -2874,16 +3188,56 @@ pub struct AuthorizationSession {
 }
 
 impl AuthorizationSession {
-    /// create new authorization session
+    /// Create a new authorization session, selecting a client registration
+    /// mechanism per the [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+    /// priority order:
+    ///
+    /// 1. Pre-registered client information
+    ///    ([`AuthorizationRequest::with_preregistered_client`]), when available
+    /// 2. Client ID Metadata Documents
+    ///    ([`AuthorizationRequest::with_client_metadata_url`]), when the
+    ///    authorization server advertises `client_id_metadata_document_supported`
+    /// 3. Dynamic Client Registration, when the authorization server
+    ///    advertises a `registration_endpoint`
+    ///
+    /// The manager must already have discovered authorization server metadata.
+    /// If `request.scopes` is empty, scopes are selected using the SDK's
+    /// normal scope-selection policy.
+    ///
+    /// On failure, the manager is returned alongside the error so callers can
+    /// retry without losing the original configuration and stores.
     pub async fn new(
         mut auth_manager: AuthorizationManager,
-        scopes: &[&str],
-        redirect_uri: &str,
-        client_name: Option<&str>,
-        client_metadata_url: Option<&str>,
-    ) -> Result<Self, AuthError> {
-        let metadata = auth_manager.metadata.as_ref();
-        let supports_url_based_client_id = metadata
+        mut request: AuthorizationRequest,
+    ) -> Result<Self, (AuthorizationManager, AuthError)> {
+        if request.client_secret.is_some() && request.client_id.is_none() {
+            return Err((
+                auth_manager,
+                AuthError::RegistrationFailed(
+                    "client_secret was provided without a pre-registered client_id; \
+                     pair with_client_secret with with_preregistered_client"
+                        .to_string(),
+                ),
+            ));
+        }
+
+        if request.scopes.is_empty() {
+            request.scopes = auth_manager.select_scopes(None, &[]);
+        } else {
+            auth_manager.add_offline_access_if_supported(&mut request.scopes);
+        }
+
+        if request.application_type.is_some() {
+            auth_manager.application_type = request.application_type.clone();
+        }
+
+        let redirect_uri = request.redirect_uri.clone();
+        let scopes = request.scopes.clone();
+        let scope_refs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
+
+        let supports_url_based_client_id = auth_manager
+            .metadata
+            .as_ref()
             .and_then(|m| {
                 m.additional_fields
                     .get("client_id_metadata_document_supported")
@@ -2891,56 +3245,78 @@ impl AuthorizationSession {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let config = if supports_url_based_client_id {
-            if let Some(client_metadata_url) = client_metadata_url {
-                if !is_https_url(client_metadata_url) {
-                    return Err(AuthError::RegistrationFailed(format!(
+        // 1. pre-registered client information takes priority over everything else
+        let config = if let Some(client_id) = &request.client_id {
+            OAuthClientConfig {
+                client_id: client_id.clone(),
+                client_secret: request.client_secret.clone(),
+                scopes: scopes.clone(),
+                redirect_uri: redirect_uri.clone(),
+                application_type: request.application_type.clone(),
+            }
+        // 2. CIMD (SEP-991), when the server advertises support and the client hosts a metadata document
+        } else if let Some(client_metadata_url) = request.client_metadata_url.as_deref()
+            && supports_url_based_client_id
+        {
+            if !is_https_url(client_metadata_url) {
+                return Err((
+                    auth_manager,
+                    AuthError::RegistrationFailed(format!(
                         "client_metadata_url must be a valid HTTPS URL with a non-root pathname, got: {}",
                         client_metadata_url
-                    )));
-                }
-                // SEP-991: URL-based Client IDs - use URL as client_id directly.
-                // SEP-837: match the hosted client-metadata.json application_type ("native")
-                OAuthClientConfig {
-                    client_id: client_metadata_url.to_string(),
-                    client_secret: None,
-                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
-                    redirect_uri: redirect_uri.to_string(),
-                    application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
-                }
-            } else {
-                // Fallback to dynamic registration
-                auth_manager
-                    .register_client(client_name.unwrap_or("MCP Client"), redirect_uri, scopes)
-                    .await
-                    .map_err(|e| {
-                        AuthError::RegistrationFailed(format!("Dynamic registration failed: {}", e))
-                    })?
+                    )),
+                ));
             }
+            // SEP-991: URL-based Client IDs - use URL as client_id directly.
+            // SEP-837: match the hosted client-metadata.json application_type ("native")
+            OAuthClientConfig {
+                client_id: client_metadata_url.to_string(),
+                client_secret: None,
+                scopes: scopes.clone(),
+                redirect_uri: redirect_uri.clone(),
+                application_type: Some(
+                    request
+                        .application_type
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_APPLICATION_TYPE.to_string()),
+                ),
+            }
+        // 3. fall back to dynamic client registration
         } else {
-            // Fallback to dynamic registration
             match auth_manager
-                .register_client(client_name.unwrap_or("MCP Client"), redirect_uri, scopes)
+                .register_client(
+                    request.client_name.as_deref().unwrap_or("MCP Client"),
+                    &redirect_uri,
+                    &scope_refs,
+                )
                 .await
             {
                 Ok(config) => config,
                 Err(e) => {
-                    return Err(AuthError::RegistrationFailed(format!(
-                        "Dynamic registration failed: {}",
-                        e
-                    )));
+                    return Err((
+                        auth_manager,
+                        AuthError::RegistrationFailed(format!(
+                            "Dynamic registration failed: {}",
+                            e
+                        )),
+                    ));
                 }
             }
         };
 
         // reset client config
-        auth_manager.configure_client(config)?;
-        let auth_url = auth_manager.get_authorization_url(scopes).await?;
+        if let Err(e) = auth_manager.configure_client(config) {
+            return Err((auth_manager, e));
+        }
+        let auth_url = match auth_manager.get_authorization_url(&scope_refs).await {
+            Ok(url) => url,
+            Err(e) => return Err((auth_manager, e)),
+        };
 
         Ok(Self {
             auth_manager,
             auth_url,
-            redirect_uri: redirect_uri.to_string(),
+            redirect_uri,
         })
     }
 
@@ -3072,7 +3448,7 @@ impl OAuthState {
         )
     }
 
-    async fn placeholder(&self) -> Result<Self, AuthError> {
+    async fn placeholder_state(&self) -> Result<Self, AuthError> {
         let (http_client, refresh_redirect_policy) = self.oauth_http_client_config();
         Ok(OAuthState::Unauthorized(
             AuthorizationManager::new_inner(
@@ -3142,16 +3518,17 @@ impl OAuthState {
 
             *manager.current_scopes.write().await = granted_scopes.clone();
 
+            let resolution = manager.resolve_metadata().await?;
+            manager.metadata = Some(resolution.metadata);
+
             let stored = StoredCredentials {
                 client_id: client_id.to_string(),
                 token_response: Some(credentials),
                 granted_scopes,
                 token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                issuer: manager.metadata_issuer(),
             };
             manager.credential_store.save(stored).await?;
-
-            let metadata = manager.discover_metadata().await?;
-            manager.metadata = Some(metadata);
 
             manager.configure_client_id(client_id)?;
 
@@ -3164,59 +3541,65 @@ impl OAuthState {
         }
     }
 
-    /// start authorization
+    /// Start authorization.
+    ///
+    /// Selects a client registration mechanism from the identity material in
+    /// `request`, following the [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+    /// priority order:
+    ///
+    /// 1. Pre-registered client information
+    ///    ([`AuthorizationRequest::with_preregistered_client`]), when available
+    /// 2. Client ID Metadata Documents
+    ///    ([`AuthorizationRequest::with_client_metadata_url`]), when the
+    ///    authorization server advertises `client_id_metadata_document_supported`
+    /// 3. Dynamic Client Registration, when the authorization server
+    ///    advertises a `registration_endpoint`
+    ///
+    /// If `request.scopes` is empty, scopes are selected using the SDK's
+    /// normal scope-selection policy.
+    ///
+    /// On failure, the state returns to `Unauthorized` so callers can retry
+    /// without losing the original configuration and stores.
     pub async fn start_authorization(
         &mut self,
-        scopes: &[&str],
-        redirect_uri: &str,
-        client_name: Option<&str>,
+        request: AuthorizationRequest,
     ) -> Result<(), AuthError> {
-        self.start_authorization_with_metadata_url(scopes, redirect_uri, client_name, None)
-            .await
-    }
-
-    /// start authorization with optional client metadata URL (SEP-991)
-    pub async fn start_authorization_with_metadata_url(
-        &mut self,
-        scopes: &[&str],
-        redirect_uri: &str,
-        client_name: Option<&str>,
-        client_metadata_url: Option<&str>,
-    ) -> Result<(), AuthError> {
-        let placeholder = self.placeholder().await?;
-        if let OAuthState::Unauthorized(mut manager) = std::mem::replace(self, placeholder) {
-            debug!("start discovery");
-            let metadata = manager.discover_metadata().await?;
-            manager.metadata = Some(metadata);
-            let selected_scopes: Vec<String> = if scopes.is_empty() {
-                manager.select_scopes(None, &[])
-            } else {
-                let mut s: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
-                manager.add_offline_access_if_supported(&mut s);
-                s
-            };
-            let scope_refs: Vec<&str> = selected_scopes.iter().map(|s| s.as_str()).collect();
-            debug!("start session");
-            let session = AuthorizationSession::new(
-                manager,
-                &scope_refs,
-                redirect_uri,
-                client_name,
-                client_metadata_url,
-            )
-            .await?;
-            *self = OAuthState::Session(session);
-            Ok(())
-        } else {
-            Err(AuthError::InternalError(
+        let placeholder = self.placeholder_state().await?;
+        let old = std::mem::replace(self, placeholder);
+        let OAuthState::Unauthorized(mut manager) = old else {
+            *self = old;
+            return Err(AuthError::InternalError(
                 "Already in session state".to_string(),
-            ))
+            ));
+        };
+        debug!("start discovery");
+        let resolution = manager
+            .resolve_metadata_from_challenge(request.challenge.as_deref())
+            .await;
+        let metadata = match resolution {
+            Ok(resolution) => resolution.metadata,
+            Err(e) => {
+                *self = OAuthState::Unauthorized(manager);
+                return Err(e);
+            }
+        };
+        manager.metadata = Some(metadata);
+        debug!("start session");
+        match AuthorizationSession::new(manager, request).await {
+            Ok(session) => {
+                *self = OAuthState::Session(session);
+                Ok(())
+            }
+            Err((manager, e)) => {
+                *self = OAuthState::Unauthorized(manager);
+                Err(e)
+            }
         }
     }
 
     /// complete authorization
     pub async fn complete_authorization(&mut self) -> Result<(), AuthError> {
-        let placeholder = self.placeholder().await?;
+        let placeholder = self.placeholder_state().await?;
         if let OAuthState::Session(session) = std::mem::replace(self, placeholder) {
             *self = OAuthState::Authorized(session.auth_manager);
             Ok(())
@@ -3226,7 +3609,7 @@ impl OAuthState {
     }
     /// covert to authorized http client
     pub async fn to_authorized_http_client(&mut self) -> Result<(), AuthError> {
-        let placeholder = self.placeholder().await?;
+        let placeholder = self.placeholder_state().await?;
         if let OAuthState::Authorized(manager) = std::mem::replace(self, placeholder) {
             *self = OAuthState::AuthorizedHttpClient(AuthorizedHttpClient::new(
                 Arc::new(manager),
@@ -3246,7 +3629,7 @@ impl OAuthState {
         required_scope: &str,
         redirect_uri: &str,
     ) -> Result<String, AuthError> {
-        let placeholder = self.placeholder().await?;
+        let placeholder = self.placeholder_state().await?;
         let old = std::mem::replace(self, placeholder);
         let OAuthState::Authorized(manager) = old else {
             *self = old;
@@ -3378,7 +3761,7 @@ impl OAuthState {
         &mut self,
         config: ClientCredentialsConfig,
     ) -> Result<(), AuthError> {
-        let placeholder = self.placeholder().await?;
+        let placeholder = self.placeholder_state().await?;
         let OAuthState::Unauthorized(mut manager) = std::mem::replace(self, placeholder) else {
             return Err(AuthError::InternalError(
                 "Client credentials flow requires Unauthorized state".to_string(),
@@ -3386,8 +3769,8 @@ impl OAuthState {
         };
 
         // Discover metadata
-        let metadata = manager.discover_metadata().await?;
-        manager.metadata = Some(metadata);
+        let resolution = manager.resolve_metadata().await?;
+        manager.metadata = Some(resolution.metadata);
 
         // Validate server supports the requested auth method
         manager.validate_client_credentials_metadata(&config)?;
@@ -3416,9 +3799,10 @@ mod tests {
 
     use super::{
         AuthError, AuthorizationCallback, AuthorizationManager, AuthorizationMetadata,
-        InMemoryStateStore, OAuthClientConfig, OAuthHttpClient, OAuthHttpClientError,
-        OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest, ScopeUpgradeConfig,
-        StateStore, StoredAuthorizationState, is_https_url,
+        AuthorizationMetadataSource, AuthorizationRequest, AuthorizationSession, CredentialStore,
+        InMemoryCredentialStore, InMemoryStateStore, OAuthClientConfig, OAuthHttpClient,
+        OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest,
+        ScopeUpgradeConfig, StateStore, StoredAuthorizationState, is_https_url,
     };
     use crate::transport::auth::VendorExtraTokenFields;
 
@@ -3521,7 +3905,7 @@ mod tests {
         .await
         .unwrap();
 
-        let metadata = manager.discover_metadata().await.unwrap();
+        let metadata = manager.resolve_metadata().await.unwrap().metadata;
 
         assert_eq!(metadata.token_endpoint, "https://auth.example.com/token");
         assert_eq!(
@@ -3584,7 +3968,7 @@ mod tests {
         .await
         .unwrap();
 
-        let metadata = manager.discover_metadata().await.unwrap();
+        let metadata = manager.resolve_metadata().await.unwrap().metadata;
 
         assert_eq!(
             (
@@ -3643,7 +4027,7 @@ mod tests {
         .await
         .unwrap();
 
-        let error = manager.discover_metadata().await.unwrap_err();
+        let error = manager.resolve_metadata().await.unwrap_err();
 
         assert!(
             matches!(
@@ -3658,8 +4042,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn authorization_metadata_accepts_oidc_path_appended_issuer() {
+    #[tokio::test]
+    async fn authorization_metadata_accepts_oidc_path_appended_issuer() {
         let discovery_url =
             Url::parse("https://auth.example.com/tenant1/.well-known/openid-configuration")
                 .unwrap();
@@ -3669,8 +4053,12 @@ mod tests {
             token_endpoint: "https://auth.example.com/tenant1/token".to_string(),
             ..Default::default()
         };
+        let manager = AuthorizationManager::new("https://mcp.example.com/")
+            .await
+            .unwrap();
 
-        AuthorizationManager::validate_authorization_metadata_issuer(&discovery_url, &metadata)
+        manager
+            .validate_authorization_metadata_issuer(&discovery_url, &metadata)
             .unwrap();
     }
 
@@ -3686,8 +4074,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn authorization_metadata_accepts_oidc_path_inserted_issuer() {
+    #[tokio::test]
+    async fn authorization_metadata_accepts_oidc_path_inserted_issuer() {
         let discovery_url =
             Url::parse("https://auth.example.com/.well-known/openid-configuration/tenant1")
                 .unwrap();
@@ -3697,13 +4085,17 @@ mod tests {
             token_endpoint: "https://auth.example.com/tenant1/token".to_string(),
             ..Default::default()
         };
+        let manager = AuthorizationManager::new("https://mcp.example.com/")
+            .await
+            .unwrap();
 
-        AuthorizationManager::validate_authorization_metadata_issuer(&discovery_url, &metadata)
+        manager
+            .validate_authorization_metadata_issuer(&discovery_url, &metadata)
             .unwrap();
     }
 
-    #[test]
-    fn authorization_metadata_rejects_missing_issuer_for_standard_discovery_url() {
+    #[tokio::test]
+    async fn authorization_metadata_allows_missing_issuer_when_configured() {
         let discovery_url =
             Url::parse("https://auth.example.com/.well-known/openid-configuration/tenant1")
                 .unwrap();
@@ -3714,9 +4106,34 @@ mod tests {
             ..Default::default()
         };
 
-        let error =
-            AuthorizationManager::validate_authorization_metadata_issuer(&discovery_url, &metadata)
-                .unwrap_err();
+        let mut manager = AuthorizationManager::new("https://mcp.example.com/")
+            .await
+            .unwrap();
+        manager.set_allow_missing_issuer(true);
+
+        manager
+            .validate_authorization_metadata_issuer(&discovery_url, &metadata)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorization_metadata_rejects_missing_issuer_by_default() {
+        let discovery_url =
+            Url::parse("https://auth.example.com/.well-known/openid-configuration/tenant1")
+                .unwrap();
+        let metadata = AuthorizationMetadata {
+            issuer: None,
+            authorization_endpoint: "https://auth.example.com/tenant1/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/tenant1/token".to_string(),
+            ..Default::default()
+        };
+        let manager = AuthorizationManager::new("https://mcp.example.com/")
+            .await
+            .unwrap();
+
+        let error = manager
+            .validate_authorization_metadata_issuer(&discovery_url, &metadata)
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -3739,7 +4156,6 @@ mod tests {
             .body(Vec::new())
             .unwrap();
         let client = RecordingOAuthHttpClient::with_responses(vec![
-            empty_response(404),
             challenge,
             http_response(
                 200,
@@ -3766,7 +4182,7 @@ mod tests {
         .await
         .unwrap();
 
-        let metadata = manager.discover_metadata().await.unwrap();
+        let metadata = manager.resolve_metadata().await.unwrap().metadata;
 
         assert_eq!(
             (
@@ -3781,7 +4197,6 @@ mod tests {
                 "https://auth.example.com/tenant1/token",
                 vec![
                     "https://mcp.example.com/mcp",
-                    "https://mcp.example.com/mcp",
                     "https://mcp.example.com/custom/metadata/location.json",
                     "https://auth.example.com/.well-known/oauth-authorization-server/tenant1",
                     "https://auth.example.com/.well-known/openid-configuration/tenant1",
@@ -3789,21 +4204,18 @@ mod tests {
                 ],
             )
         );
-        assert_eq!(
+        assert!(
             client
                 .requests()
                 .iter()
-                .take(2)
-                .map(|request| request.method.as_str())
-                .collect::<Vec<_>>(),
-            vec!["GET", "POST"]
+                .all(|request| request.method == "GET"),
+            "discovery must not send non-GET requests"
         );
     }
 
     #[tokio::test]
-    async fn discover_metadata_falls_back_to_legacy_default_endpoints() {
+    async fn resolve_metadata_reports_legacy_fallback_when_nothing_is_discovered() {
         let client = RecordingOAuthHttpClient::with_responses(vec![
-            empty_response(404),
             empty_response(404),
             empty_response(404),
             empty_response(404),
@@ -3816,13 +4228,14 @@ mod tests {
         .await
         .unwrap();
 
-        let metadata = manager.discover_metadata().await.unwrap();
+        let resolution = manager.resolve_metadata().await.unwrap();
 
         assert_eq!(
             (
-                metadata.authorization_endpoint.as_str(),
-                metadata.token_endpoint.as_str(),
-                metadata.registration_endpoint.as_deref(),
+                resolution.source,
+                resolution.metadata.authorization_endpoint.as_str(),
+                resolution.metadata.token_endpoint.as_str(),
+                resolution.metadata.registration_endpoint.as_deref(),
                 client
                     .requests()
                     .iter()
@@ -3830,11 +4243,11 @@ mod tests {
                     .collect::<Vec<_>>(),
             ),
             (
+                AuthorizationMetadataSource::LegacyEndpointFallback,
                 "https://legacy.example.com/authorize",
                 "https://legacy.example.com/token",
                 Some("https://legacy.example.com/register"),
                 vec![
-                    "https://legacy.example.com/",
                     "https://legacy.example.com/",
                     "https://legacy.example.com/.well-known/oauth-protected-resource",
                     "https://legacy.example.com/.well-known/oauth-authorization-server",
@@ -3842,6 +4255,626 @@ mod tests {
                 ],
             )
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_metadata_reports_protected_resource_metadata() {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            challenge,
+            http_response(
+                200,
+                serde_json::json!({
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            http_response(
+                200,
+                serde_json::json!({
+                    "issuer": "https://auth.example.com",
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token"
+                }),
+            ),
+        ]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        let resolution = manager.resolve_metadata().await.unwrap();
+
+        assert_eq!(
+            (
+                resolution.source,
+                resolution.metadata.token_endpoint.as_str(),
+            ),
+            (
+                AuthorizationMetadataSource::ProtectedResourceMetadata,
+                "https://auth.example.com/token",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_metadata_from_challenge_uses_challenge_pointer_and_scope() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            http_response(
+                200,
+                serde_json::json!({
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            http_response(
+                200,
+                serde_json::json!({
+                    "issuer": "https://auth.example.com",
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token"
+                }),
+            ),
+        ]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let resolution = manager
+            .resolve_metadata_from_challenge(Some(
+                r#"Bearer resource_metadata="https://mcp.example.com/custom/prm.json", scope="mcp:read mcp:write""#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                resolution.source,
+                resolution.metadata.token_endpoint.as_str(),
+                manager.select_scopes(None, &[]),
+                client.requests().first().map(|request| request.uri.clone()),
+            ),
+            (
+                AuthorizationMetadataSource::ProtectedResourceMetadata,
+                "https://auth.example.com/token",
+                vec!["mcp:read".to_string(), "mcp:write".to_string()],
+                // discovery starts at the challenge's pointer: no probing
+                Some("https://mcp.example.com/custom/prm.json".to_string()),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_metadata_from_challenge_falls_back_without_metadata_pointer() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            empty_response(404),
+            empty_response(404),
+            empty_response(404),
+            empty_response(404),
+        ]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://legacy.example.com/",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        let resolution = manager
+            .resolve_metadata_from_challenge(Some(r#"Bearer scope="mcp:basic""#))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (resolution.source, manager.select_scopes(None, &[]),),
+            (
+                AuthorizationMetadataSource::LegacyEndpointFallback,
+                vec!["mcp:basic".to_string()],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_metadata_reports_authorization_server_metadata() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            empty_response(404),
+            empty_response(404),
+            empty_response(404),
+            http_response(
+                200,
+                serde_json::json!({
+                    "issuer": "https://mcp.example.com",
+                    "authorization_endpoint": "https://mcp.example.com/oauth/authorize",
+                    "token_endpoint": "https://mcp.example.com/oauth/token"
+                }),
+            ),
+        ]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        let resolution = manager.resolve_metadata().await.unwrap();
+
+        assert_eq!(
+            (
+                resolution.source,
+                resolution.metadata.token_endpoint.as_str(),
+            ),
+            (
+                AuthorizationMetadataSource::AuthorizationServerMetadata,
+                "https://mcp.example.com/oauth/token",
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::protected_resource_metadata(
+        AuthorizationMetadataSource::ProtectedResourceMetadata,
+        true
+    )]
+    #[case::authorization_server_metadata(
+        AuthorizationMetadataSource::AuthorizationServerMetadata,
+        true
+    )]
+    #[case::legacy_endpoint_fallback(AuthorizationMetadataSource::LegacyEndpointFallback, false)]
+    fn is_discovered_is_false_only_for_the_legacy_fallback(
+        #[case] source: AuthorizationMetadataSource,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(source.is_discovered(), expected);
+    }
+
+    fn preregistered_as_metadata_response() -> HttpResponse {
+        http_response(
+            200,
+            serde_json::json!({
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+                "registration_endpoint": "https://auth.example.com/register",
+                "scopes_supported": ["read", "write", "offline_access"]
+            }),
+        )
+    }
+
+    /// discovery responses for the preregistered-client tests: a 401 challenge
+    /// pointing at protected resource metadata, the PRM document, then the
+    /// authorization server metadata.
+    fn preregistered_discovery_responses() -> Vec<HttpResponse> {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        vec![
+            challenge,
+            http_response(
+                200,
+                serde_json::json!({
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            preregistered_as_metadata_response(),
+        ]
+    }
+
+    fn auth_url_query(auth_url: &str) -> HashMap<String, String> {
+        Url::parse(auth_url)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn preregistered_client_skips_registration_endpoint() {
+        let client = RecordingOAuthHttpClient::with_responses(preregistered_discovery_responses());
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_preregistered_client("preregistered-client")
+            .with_client_secret("secret")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        // the registration endpoint was advertised but must not be called
+        let requests = client.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.uri.contains("/register")),
+            "registration endpoint should not be called: {requests:?}"
+        );
+
+        let auth_url = state.get_authorization_url().await.unwrap();
+        let query = auth_url_query(&auth_url);
+        assert_eq!(query.get("client_id").unwrap(), "preregistered-client");
+        assert!(matches!(state, super::OAuthState::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn authorization_session_selects_default_scopes_when_none_provided() {
+        let client = RecordingOAuthHttpClient::with_responses(preregistered_discovery_responses());
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.metadata = Some(manager.resolve_metadata().await.unwrap().metadata);
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_preregistered_client("preregistered-client");
+        let session = match AuthorizationSession::new(manager, request).await {
+            Ok(session) => session,
+            Err((_, error)) => panic!("authorization session creation failed: {error}"),
+        };
+
+        // Empty request scopes fall back to the discovered scopes_supported.
+        let query = auth_url_query(&session.auth_url);
+        assert_eq!(query.get("scope").unwrap(), "read write offline_access");
+    }
+
+    #[tokio::test]
+    async fn preregistered_client_uses_explicit_scopes_and_adds_offline_access() {
+        let client = RecordingOAuthHttpClient::with_responses(preregistered_discovery_responses());
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_preregistered_client("preregistered-client")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        // explicit scopes are preserved; offline_access is appended per SEP-2207
+        let auth_url = state.get_authorization_url().await.unwrap();
+        let query = auth_url_query(&auth_url);
+        assert_eq!(query.get("scope").unwrap(), "read offline_access");
+    }
+
+    #[tokio::test]
+    async fn preregistered_client_recovers_unauthorized_state_after_discovery_failure() {
+        // first discovery attempt fails: protected resource metadata reports a
+        // mismatched resource identifier, which discover_metadata rejects
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            challenge,
+            http_response(
+                200,
+                serde_json::json!({
+                    "resource": "https://other.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+        ]);
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_preregistered_client("preregistered-client")
+            .with_scopes(["read"]);
+        let err = state
+            .start_authorization(request.clone())
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, AuthError::InternalError(_)), "{err:?}");
+        assert!(
+            matches!(state, super::OAuthState::Unauthorized(_)),
+            "state should return to Unauthorized after a transient failure"
+        );
+
+        // retrying with the same state succeeds once the server responds
+        client
+            .responses
+            .lock()
+            .unwrap()
+            .extend(preregistered_discovery_responses());
+        state.start_authorization(request).await.unwrap();
+        assert!(matches!(state, super::OAuthState::Session(_)));
+    }
+
+    fn cimd_as_metadata_response() -> HttpResponse {
+        http_response(
+            200,
+            serde_json::json!({
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+                "registration_endpoint": "https://auth.example.com/register",
+                "scopes_supported": ["read", "write", "offline_access"],
+                "client_id_metadata_document_supported": true
+            }),
+        )
+    }
+
+    /// discovery responses like [`preregistered_discovery_responses`] but the
+    /// authorization server advertises CIMD support.
+    fn cimd_discovery_responses() -> Vec<HttpResponse> {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        vec![
+            challenge,
+            http_response(
+                200,
+                serde_json::json!({
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            cimd_as_metadata_response(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn preregistered_client_takes_priority_over_cimd() {
+        // server supports CIMD and the request carries both pre-registered
+        // credentials and a client metadata URL: pre-registration wins
+        let client = RecordingOAuthHttpClient::with_responses(cimd_discovery_responses());
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_preregistered_client("preregistered-client")
+            .with_client_metadata_url("https://client.example.com/client-metadata.json")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        let requests = client.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.uri.contains("/register")),
+            "registration endpoint should not be called: {requests:?}"
+        );
+        let auth_url = state.get_authorization_url().await.unwrap();
+        let query = auth_url_query(&auth_url);
+        assert_eq!(query.get("client_id").unwrap(), "preregistered-client");
+    }
+
+    #[tokio::test]
+    async fn cimd_used_when_server_advertises_support() {
+        let client = RecordingOAuthHttpClient::with_responses(cimd_discovery_responses());
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_client_metadata_url("https://client.example.com/client-metadata.json")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        // CIMD takes priority over the advertised registration endpoint
+        let requests = client.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.uri.contains("/register")),
+            "registration endpoint should not be called: {requests:?}"
+        );
+        let auth_url = state.get_authorization_url().await.unwrap();
+        let query = auth_url_query(&auth_url);
+        assert_eq!(
+            query.get("client_id").unwrap(),
+            "https://client.example.com/client-metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn cimd_falls_back_to_dcr_when_server_lacks_support() {
+        // server does not advertise client_id_metadata_document_supported, so
+        // the client metadata URL is ignored and DCR is used instead
+        let mut responses = preregistered_discovery_responses();
+        responses.push(http_response(
+            201,
+            serde_json::json!({
+                "client_id": "dcr-client",
+                "redirect_uris": ["http://localhost:8080/callback"]
+            }),
+        ));
+        let client = RecordingOAuthHttpClient::with_responses(responses);
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_client_metadata_url("https://client.example.com/client-metadata.json")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        let requests = client.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.uri.contains("/register")),
+            "registration endpoint should be called: {requests:?}"
+        );
+        let auth_url = state.get_authorization_url().await.unwrap();
+        let query = auth_url_query(&auth_url);
+        assert_eq!(query.get("client_id").unwrap(), "dcr-client");
+    }
+
+    #[tokio::test]
+    async fn dcr_used_when_no_identity_material_is_provided() {
+        let mut responses = preregistered_discovery_responses();
+        responses.push(http_response(
+            201,
+            serde_json::json!({
+                "client_id": "dcr-client",
+                "redirect_uris": ["http://localhost:8080/callback"]
+            }),
+        ));
+        let client = RecordingOAuthHttpClient::with_responses(responses);
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_client_name("test-client")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        let auth_url = state.get_authorization_url().await.unwrap();
+        let query = auth_url_query(&auth_url);
+        assert_eq!(query.get("client_id").unwrap(), "dcr-client");
+        assert!(matches!(state, super::OAuthState::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn dcr_registration_uses_requested_application_type() {
+        let mut responses = preregistered_discovery_responses();
+        responses.push(http_response(
+            201,
+            serde_json::json!({
+                "client_id": "dcr-client",
+                "redirect_uris": ["http://localhost:8080/callback"]
+            }),
+        ));
+        let client = RecordingOAuthHttpClient::with_responses(responses);
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_client_name("test-client")
+            .with_application_type("web")
+            .with_scopes(["read"]);
+        state.start_authorization(request).await.unwrap();
+
+        // SEP-837: the requested application_type must be sent in the DCR request
+        let requests = client.requests();
+        let registration = requests
+            .iter()
+            .find(|request| request.uri.contains("/register"))
+            .expect("registration endpoint should be called");
+        let body: serde_json::Value = serde_json::from_slice(&registration.body).unwrap();
+        assert_eq!(body.get("application_type").unwrap(), "web");
+    }
+
+    #[tokio::test]
+    async fn cimd_rejects_non_https_client_metadata_url_and_recovers_state() {
+        let client = RecordingOAuthHttpClient::with_responses(cimd_discovery_responses());
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_client_metadata_url("http://client.example.com/client-metadata.json")
+            .with_scopes(["read"]);
+        let err = state.start_authorization(request).await.unwrap_err();
+        assert!(matches!(err, AuthError::RegistrationFailed(_)), "{err:?}");
+        assert!(
+            matches!(state, super::OAuthState::Unauthorized(_)),
+            "state should return to Unauthorized after a registration failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn dcr_recovers_unauthorized_state_after_registration_failure() {
+        // discovery succeeds, but the registration endpoint rejects the request
+        let mut responses = preregistered_discovery_responses();
+        responses.push(http_response(
+            400,
+            serde_json::json!({"error": "invalid_client_metadata"}),
+        ));
+        let client = RecordingOAuthHttpClient::with_responses(responses);
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = AuthorizationRequest::new("http://localhost:8080/callback")
+            .with_client_name("test-client")
+            .with_scopes(["read"]);
+        let err = state
+            .start_authorization(request.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::RegistrationFailed(_)), "{err:?}");
+        assert!(
+            matches!(state, super::OAuthState::Unauthorized(_)),
+            "state should return to Unauthorized after a registration failure"
+        );
+
+        // retrying with the same state succeeds once the server accepts
+        // registration (discovery runs again on retry)
+        {
+            let mut responses = client.responses.lock().unwrap();
+            responses.extend(preregistered_discovery_responses());
+            responses.push_back(http_response(
+                201,
+                serde_json::json!({
+                    "client_id": "dcr-client",
+                    "redirect_uris": ["http://localhost:8080/callback"]
+                }),
+            ));
+        }
+        state.start_authorization(request).await.unwrap();
+        assert!(matches!(state, super::OAuthState::Session(_)));
     }
 
     #[tokio::test]
@@ -3946,7 +4979,7 @@ mod tests {
         .await
         .unwrap();
 
-        let metadata = manager.discover_metadata().await.unwrap();
+        let metadata = manager.resolve_metadata().await.unwrap().metadata;
         let requests = client.requests();
 
         assert_eq!(
@@ -4003,7 +5036,7 @@ mod tests {
         .await
         .unwrap();
 
-        let metadata = manager.discover_metadata().await.unwrap();
+        let metadata = manager.resolve_metadata().await.unwrap().metadata;
 
         assert_eq!(
             (
@@ -4052,7 +5085,7 @@ mod tests {
         .await
         .unwrap();
 
-        let error = manager.discover_metadata().await.unwrap_err();
+        let error = manager.resolve_metadata().await.unwrap_err();
 
         assert!(
             matches!(error, AuthError::MetadataError(ref message) if message.contains("resource mismatch")),
@@ -4087,7 +5120,7 @@ mod tests {
         .await
         .unwrap();
 
-        let error = manager.discover_metadata().await.unwrap_err();
+        let error = manager.resolve_metadata().await.unwrap_err();
 
         assert!(
             matches!(error, AuthError::MetadataError(ref message) if message.contains("missing required resource")),
@@ -4617,6 +5650,7 @@ mod tests {
             token_response: Some(token_response),
             granted_scopes: vec![],
             token_received_at: None,
+            issuer: None,
         };
         let debug_output = format!("{:?}", creds);
 
@@ -4800,6 +5834,34 @@ mod tests {
             ..Default::default()
         }));
         mgr
+    }
+
+    #[tokio::test]
+    async fn initialize_from_store_clears_dcr_credentials_when_issuer_changes() {
+        let store = InMemoryCredentialStore::new();
+        store
+            .save(StoredCredentials {
+                client_id: "dcr-client".to_string(),
+                token_response: Some(make_token_response("old-token", Some(3600))),
+                granted_scopes: vec![],
+                token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                issuer: Some("https://old.example.com".to_string()),
+            })
+            .await
+            .unwrap();
+        let mut manager = manager_with_metadata(Some(AuthorizationMetadata {
+            authorization_endpoint: "https://new.example.com/authorize".to_string(),
+            token_endpoint: "https://new.example.com/token".to_string(),
+            issuer: Some("https://new.example.com".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        manager.set_credential_store(store.clone());
+
+        let initialized = manager.initialize_from_store().await.unwrap();
+        let credentials_cleared = store.load().await.unwrap().is_none();
+
+        assert_eq!((initialized, credentials_cleared), (false, true));
     }
 
     fn test_client_config() -> OAuthClientConfig {
@@ -5594,6 +6656,7 @@ mod tests {
             token_response: Some(make_token_response("my-access-token", Some(3600))),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -5611,6 +6674,7 @@ mod tests {
             token_response: Some(make_token_response("stale-token", Some(3600))),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs() - 7200),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -5629,6 +6693,7 @@ mod tests {
             token_response: Some(make_token_response("no-expiry-token", None)),
             granted_scopes: vec![],
             token_received_at: None,
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -5646,6 +6711,7 @@ mod tests {
             token_response: Some(make_token_response("almost-expired", Some(3600))),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs() - 3590),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -5664,6 +6730,7 @@ mod tests {
             token_response: Some(make_token_response("stale-token", Some(3600))),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs() - 7200),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -5754,6 +6821,86 @@ mod tests {
     }
 
     // -- client credentials (SEP-1046) --
+
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[test]
+    fn client_authentication_audience_defaults_to_metadata_issuer() {
+        let metadata = AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            issuer: Some("https://auth.example.com".to_string()),
+            ..Default::default()
+        };
+
+        let audience = super::client_authentication_audience(&metadata, None).unwrap();
+
+        assert_eq!(audience, "https://auth.example.com");
+    }
+
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[test]
+    fn client_authentication_audience_honors_explicit_override() {
+        let metadata = AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            issuer: Some("https://auth.example.com".to_string()),
+            ..Default::default()
+        };
+
+        let audience = super::client_authentication_audience(
+            &metadata,
+            Some("https://legacy.example.com/token"),
+        )
+        .unwrap();
+
+        assert_eq!(audience, "https://legacy.example.com/token");
+    }
+
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[test]
+    fn client_authentication_audience_rejects_missing_metadata_issuer() {
+        let metadata = AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            ..Default::default()
+        };
+
+        let error = super::client_authentication_audience(&metadata, None).unwrap_err();
+
+        assert!(matches!(error, AuthError::ClientCredentialsError(_)));
+    }
+
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[test]
+    fn client_authentication_header_sets_explicit_type() {
+        let header = super::client_authentication_header(super::JwtSigningAlgorithm::ES256);
+
+        assert_eq!(header.typ.as_deref(), Some("client-authentication+jwt"));
+    }
+
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[test]
+    fn client_credentials_endpoint_allows_http_between_loopback_hosts() {
+        let resource = Url::parse("http://localhost:8000/mcp").unwrap();
+        let token_endpoint = Url::parse("http://127.0.0.1:9000/token").unwrap();
+
+        assert!(super::is_allowed_client_credentials_endpoint(
+            &resource,
+            &token_endpoint
+        ));
+    }
+
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[test]
+    fn client_credentials_endpoint_rejects_http_to_non_loopback_host() {
+        let resource = Url::parse("http://localhost:8000/mcp").unwrap();
+        let token_endpoint = Url::parse("http://auth.example.com/token").unwrap();
+
+        assert!(!super::is_allowed_client_credentials_endpoint(
+            &resource,
+            &token_endpoint
+        ));
+    }
 
     #[tokio::test]
     async fn configure_client_credentials_uses_request_body_auth_for_client_secret() {
@@ -5965,6 +7112,7 @@ mod tests {
                 )),
                 granted_scopes: vec![],
                 token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                issuer: None,
             })
             .await
             .unwrap();
@@ -5993,6 +7141,7 @@ mod tests {
             token_response: None,
             granted_scopes: vec![],
             token_received_at: None,
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6013,6 +7162,7 @@ mod tests {
             token_response: Some(make_token_response("old-token", Some(3600))),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6103,6 +7253,7 @@ mod tests {
                 )),
                 granted_scopes: vec![],
                 token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                issuer: None,
             })
             .await
             .unwrap();
@@ -6308,6 +7459,7 @@ mod tests {
             )),
             granted_scopes: vec!["read".to_string(), "write".to_string()],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6345,6 +7497,7 @@ mod tests {
             )),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6382,6 +7535,7 @@ mod tests {
             )),
             granted_scopes: vec!["read".to_string()],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6419,6 +7573,7 @@ mod tests {
             )),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6457,6 +7612,7 @@ mod tests {
             )),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 
@@ -6520,6 +7676,7 @@ mod tests {
             )),
             granted_scopes: vec![],
             token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
         };
         manager.credential_store.save(stored).await.unwrap();
 

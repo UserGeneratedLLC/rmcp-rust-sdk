@@ -16,6 +16,13 @@ A client that communicates with a Git-related MCP server using standard input/ou
 
 A client that communicates with an MCP server using HTTP streaming transport.
 - Connects to an MCP server running at `http://localhost:8000`
+
+### Modern Subscription Client (`subscriptions_streamhttp.rs`)
+
+Uses modern discovery and `subscriptions/listen`, prints the accepted filter,
+and consumes tagged notifications until graceful closure or cancellation.
+
+- Run with `cargo run -p mcp-client-examples --example clients_subscriptions_streamhttp`
 - Retrieves server information and list of available tools
 - Calls a tool named "increment"
 
@@ -50,6 +57,14 @@ A client demonstrating how to authenticate with an MCP server using OAuth.
 - Establishes an authorized connection to the MCP server using the acquired access token
 - Demonstrates how to use the authorized connection to retrieve available tools and prompts
 
+### OAuth Client Credentials (`auth/client_credentials.rs`)
+
+A client demonstrating the OAuth 2.0 Client Credentials flow from SEP-1046.
+
+- Accepts the server URL, client ID, and client secret as command-line arguments
+- Authenticates without an interactive browser or callback server
+- Establishes an authorized connection and retrieves the available tools
+
 
 ### Sampling Standard I/O Client (`sampling_stdio.rs`)
 
@@ -62,12 +77,13 @@ A client demonstrating how to use the sampling tool.
 
 ### Task Standard I/O Client (`task_stdio.rs`)
 
-A client that exercises the task lifecycle against `servers_task_stdio`
-(per [SEP-1319](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)).
+A client that exercises the SEP-2663 Tasks extension lifecycle against `servers_task_stdio`
+([SEP-2663](https://modelcontextprotocol.io/extensions/tasks/overview), `io.modelcontextprotocol/tasks`).
 
 - Spawns `servers_task_stdio` as a child process over stdio
+- Declares the tasks extension in its client capabilities
 - Calls `quick_echo` synchronously
-- Calls `slow_sum` as a task via `CallToolRequestParams::with_task(...)`, polls `tasks/get` until completion, then fetches the result via `tasks/result`
+- Calls `slow_sum`, receives a `CreateTaskResult` (`resultType: "task"`), polls `tasks/get` honoring `pollIntervalMs`, and reads the final `CallToolResult` inlined in the completed task
 
 ### Progress Test Client (`progress_client.rs`)
 
@@ -98,6 +114,10 @@ cargo run -p mcp-client-examples --example clients_collection
 
 # Run the OAuth client example
 cargo run -p mcp-client-examples --example clients_oauth_client
+
+# Run the OAuth Client Credentials example
+cargo run -p mcp-client-examples --example clients_client_credentials -- \
+  <server_url> <client_id> <client_secret>
 
 # Run the sampling standard I/O client example
 cargo run -p mcp-client-examples --example clients_sampling_stdio

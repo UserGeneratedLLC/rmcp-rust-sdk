@@ -30,6 +30,7 @@ use crate::{
 };
 
 type BoxedSseStream = BoxStream<'static, Result<Sse, SseError>>;
+type SseTaskResult<E> = (Option<RequestId>, Result<(), StreamableHttpError<E>>);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn build_request_headers(
@@ -41,20 +42,20 @@ fn build_request_headers(
     use serde_json::Value;
 
     let mut headers = base.clone();
-    if *version >= ProtocolVersion::STANDARD_HEADERS {
-        if let Ok(value) = serde_json::to_value(message) {
-            let schema = value
-                .get("method")
-                .and_then(Value::as_str)
-                .filter(|method| *method == "tools/call")
-                .and_then(|_| value.get("params"))
-                .and_then(|params| params.get("name"))
-                .and_then(Value::as_str)
-                .and_then(|name| tool_cache.get(name))
-                .map(Arc::as_ref);
-            for (name, val) in mcp_headers::standard_request_headers(&value, schema) {
-                headers.insert(name, val);
-            }
+    if *version >= ProtocolVersion::STANDARD_HEADERS
+        && let Ok(value) = serde_json::to_value(message)
+    {
+        let schema = value
+            .get("method")
+            .and_then(Value::as_str)
+            .filter(|method| *method == "tools/call")
+            .and_then(|_| value.get("params"))
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .and_then(|name| tool_cache.get(name))
+            .map(Arc::as_ref);
+        for (name, val) in mcp_headers::standard_request_headers(&value, schema) {
+            headers.insert(name, val);
         }
     }
     headers
@@ -83,20 +84,25 @@ fn request_version_headers(
 
 fn cache_tools_from_response(
     cache: &mut HashMap<String, Arc<JsonObject>>,
-    message: &ServerJsonRpcMessage,
+    message: &mut ServerJsonRpcMessage,
+    protocol_version: &ProtocolVersion,
 ) {
-    if let ServerJsonRpcMessage::Response(response) = message {
-        if let ServerResult::ListToolsResult(list) = &response.result {
-            for tool in &list.tools {
-                if let Err(reason) =
+    if protocol_version < &ProtocolVersion::STANDARD_HEADERS {
+        return;
+    }
+    if let ServerJsonRpcMessage::Response(response) = message
+        && let ServerResult::ListToolsResult(list) = &mut response.result
+    {
+        list.tools.retain(|tool| {
+                let Err(reason) =
                     mcp_headers::validate_param_header_annotations(&tool.input_schema)
-                {
-                    tracing::warn!(tool = %tool.name, "ignoring x-mcp-header annotations: {reason}");
-                    continue;
-                }
-                cache.insert(tool.name.to_string(), tool.input_schema.clone());
-            }
-        }
+                else {
+                    cache.insert(tool.name.to_string(), tool.input_schema.clone());
+                    return true;
+                };
+                tracing::warn!(tool = %tool.name, "rejecting invalid x-mcp-header annotations: {reason}");
+                false
+            });
     }
 }
 
@@ -106,19 +112,20 @@ fn negotiate_version_headers(
 ) -> (ProtocolVersion, HashMap<HeaderName, HeaderValue>) {
     let mut version = ProtocolVersion::default();
     let mut headers = base;
-    if let ServerJsonRpcMessage::Response(response) = init_response {
-        if let ServerResult::InitializeResult(init_result) = &response.result {
-            version = init_result.protocol_version.clone();
-            // HeaderName::from_static requires lowercase
-            if let Ok(hv) = HeaderValue::from_str(init_result.protocol_version.as_str()) {
-                headers.insert(HeaderName::from_static("mcp-protocol-version"), hv);
-            }
+    if let ServerJsonRpcMessage::Response(response) = init_response
+        && let ServerResult::InitializeResult(init_result) = &response.result
+    {
+        version = init_result.protocol_version.clone();
+        // HeaderName::from_static requires lowercase
+        if let Ok(hv) = HeaderValue::from_str(init_result.protocol_version.as_str()) {
+            headers.insert(HeaderName::from_static("mcp-protocol-version"), hv);
         }
     }
     (version, headers)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("authorization required: {www_authenticate_header}")]
 #[non_exhaustive]
 pub struct AuthRequiredError {
     pub www_authenticate_header: String,
@@ -133,7 +140,8 @@ impl AuthRequiredError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("insufficient scope: {www_authenticate_header}")]
 #[non_exhaustive]
 pub struct InsufficientScopeError {
     pub www_authenticate_header: String,
@@ -191,13 +199,29 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     #[error("Auth error: {0}")]
     Auth(#[from] crate::transport::auth::AuthError),
     #[error("Auth required")]
-    AuthRequired(AuthRequiredError),
+    AuthRequired(#[source] AuthRequiredError),
     #[error("Insufficient scope")]
-    InsufficientScope(InsufficientScopeError),
+    InsufficientScope(#[source] InsufficientScopeError),
     #[error("Header name '{0}' is reserved and conflicts with default headers")]
     ReservedHeaderConflict(String),
     #[error("Session expired (HTTP 404)")]
     SessionExpired,
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> StreamableHttpError<E> {
+    /// The `WWW-Authenticate` challenge carried by this error, when the
+    /// server answered 401 ([`AuthRequired`](Self::AuthRequired)) or 403
+    /// ([`InsufficientScope`](Self::InsufficientScope)). Feed it to
+    /// [`AuthorizationRequest::with_challenge`](crate::transport::auth::AuthorizationRequest::with_challenge)
+    /// to authorize reactively.
+    #[cfg(feature = "auth")]
+    pub fn auth_challenge(&self) -> Option<&str> {
+        match self {
+            Self::AuthRequired(error) => Some(&error.www_authenticate_header),
+            Self::InsufficientScope(error) => Some(&error.www_authenticate_header),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Error)]
@@ -342,10 +366,14 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> impl Future<Output = Result<(), StreamableHttpError<Self::Error>>> + Send + '_;
+    /// Open an SSE stream, optionally scoped to a legacy session.
+    ///
+    /// `session_id` is `None` when resuming a stateless response using only
+    /// `last_event_id`.
     fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -369,7 +397,7 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
     fn get_stream_with_max_sse_event_size(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -393,7 +421,7 @@ pub struct RetryConfig {
 
 struct StreamableHttpClientReconnect<C> {
     pub client: C,
-    pub session_id: Arc<str>,
+    pub session_id: Option<Arc<str>>,
     pub uri: Arc<str>,
     pub auth_header: Option<String>,
     pub custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -493,8 +521,14 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         pending_stream_response_ids: &mut HashSet<RequestId>,
         message: &ServerJsonRpcMessage,
     ) {
-        if let Some(id) = Self::server_response_id(message) {
-            pending_stream_response_ids.remove(id);
+        let Some(response_id) = Self::server_response_id(message) else {
+            return;
+        };
+        if pending_stream_response_ids.remove(response_id) {
+            return;
+        }
+        if let Some(id) = response_id.numeric_string_value() {
+            pending_stream_response_ids.remove(&RequestId::Number(id));
         }
     }
 
@@ -538,37 +572,6 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         Ok(())
     }
 
-    /// Convert a raw SSE stream into a JSON-RPC message stream without
-    /// reconnection logic.
-    fn raw_sse_to_jsonrpc(
-        stream: BoxedSseStream,
-    ) -> impl Stream<Item = Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>> + Send + 'static
-    {
-        stream.filter_map(|event| async {
-            match event {
-                Err(e) => Some(Err(StreamableHttpError::Sse(e))),
-                Ok(sse) => {
-                    let is_message =
-                        matches!(sse.event.as_deref(), None | Some("") | Some("message"));
-                    if !is_message {
-                        return None;
-                    }
-                    let data = sse.data?;
-                    if data.trim().is_empty() {
-                        return None;
-                    }
-                    match serde_json::from_str::<ServerJsonRpcMessage>(&data) {
-                        Ok(msg) => Some(Ok(msg)),
-                        Err(e) => {
-                            tracing::debug!("failed to deserialize server message: {e}");
-                            None
-                        }
-                    }
-                }
-            }
-        })
-    }
-
     /// Convert an SSE stream into JSON-RPC messages with reconnect semantics.
     ///
     /// This is used for request-scoped SSE responses as well as the standalone
@@ -578,7 +581,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     fn reconnecting_sse_to_jsonrpc(
         stream: BoxedSseStream,
         client: C,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         uri: Arc<str>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -586,7 +589,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         retry_config: Arc<dyn SseRetryPolicy>,
     ) -> impl Stream<Item = Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>> + Send + 'static
     {
-        SseAutoReconnectStream::new(
+        SseAutoReconnectStream::new_after_event_id(
             stream,
             StreamableHttpClientReconnect {
                 client,
@@ -602,10 +605,8 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
 
     /// Convert a POST response SSE stream into JSON-RPC messages.
     ///
-    /// Stateful sessions can resume via GET when the response stream closes
-    /// before the server sends the matching JSON-RPC response. Stateless
-    /// transports do not have enough state to resume, so they keep the raw
-    /// SSE-to-JSON-RPC mapping.
+    /// Request-scoped streams resume via GET once the server has supplied an
+    /// event ID. The session header remains optional for stateless transports.
     fn response_sse_to_jsonrpc(
         stream: BoxedSseStream,
         session_id: Option<Arc<str>>,
@@ -616,20 +617,17 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         max_sse_event_size: usize,
         retry_config: Arc<dyn SseRetryPolicy>,
     ) -> BoxStream<'static, Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>> {
-        match session_id {
-            Some(session_id) => Self::reconnecting_sse_to_jsonrpc(
-                stream,
-                client,
-                session_id,
-                uri,
-                auth_header,
-                custom_headers,
-                max_sse_event_size,
-                retry_config,
-            )
-            .boxed(),
-            None => Self::raw_sse_to_jsonrpc(stream).boxed(),
-        }
+        Self::reconnecting_sse_to_jsonrpc(
+            stream,
+            client,
+            session_id,
+            uri,
+            auth_header,
+            custom_headers,
+            max_sse_event_size,
+            retry_config,
+        )
+        .boxed()
     }
 
     async fn execute_sse_stream(
@@ -678,7 +676,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     }
 
     fn spawn_common_stream(
-        streams: &mut tokio::task::JoinSet<Result<(), StreamableHttpError<C::Error>>>,
+        streams: &mut tokio::task::JoinSet<SseTaskResult<C::Error>>,
         client: C,
         session_id: Arc<str>,
         config: &StreamableHttpClientTransportConfig,
@@ -694,10 +692,10 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         let max_sse_event_size = config.max_sse_event_size;
 
         streams.spawn(async move {
-            match client
+            let result = match client
                 .get_stream_with_max_sse_event_size(
                     uri,
-                    session_id.clone(),
+                    Some(session_id.clone()),
                     None,
                     auth_header,
                     protocol_headers.clone(),
@@ -710,7 +708,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
                         stream,
                         StreamableHttpClientReconnect {
                             client,
-                            session_id,
+                            session_id: Some(session_id),
                             uri: reconnect_uri,
                             auth_header: reconnect_auth_header,
                             custom_headers: protocol_headers,
@@ -734,7 +732,8 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
                     tracing::error!("fail to get common stream: {error}");
                     Err(error)
                 }
-            }
+            };
+            (None, result)
         });
     }
 
@@ -882,7 +881,10 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                 ));
             }
         };
-        let mut session_id: Option<Arc<str>> = if let Some(session_id) = session_id {
+        let mut uses_modern_http = !is_legacy_startup;
+        let mut session_id: Option<Arc<str>> = if uses_modern_http {
+            None
+        } else if let Some(session_id) = session_id {
             Some(session_id.into())
         } else {
             if !self.config.allow_stateless {
@@ -946,10 +948,14 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         enum Event<W: Worker, E: std::error::Error + Send + Sync + 'static> {
             ClientMessage(WorkerSendRequest<W>),
             ServerMessage(ServerJsonRpcMessage),
-            StreamResult(Result<(), StreamableHttpError<E>>),
+            StreamResult {
+                request_id: Option<RequestId>,
+                result: Result<(), StreamableHttpError<E>>,
+            },
         }
         let mut streams = tokio::task::JoinSet::new();
         let mut pending_stream_response_ids = HashSet::new();
+        let mut request_stream_cancellations = HashMap::<RequestId, CancellationToken>::new();
         let mut awaiting_fallback_initialized = false;
         if let Some(session_id) = &session_id {
             Self::spawn_common_stream(
@@ -985,7 +991,15 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                 terminated_stream = streams.join_next(), if !streams.is_empty() => {
                     match terminated_stream {
                         Some(result) => {
-                            Event::StreamResult(result.map_err(StreamableHttpError::TokioJoinError).and_then(std::convert::identity))
+                            match result {
+                                Ok((request_id, result)) => {
+                                    Event::StreamResult { request_id, result }
+                                }
+                                Err(error) => Event::StreamResult {
+                                    request_id: None,
+                                    result: Err(StreamableHttpError::TokioJoinError(error)),
+                                },
+                            }
                         }
                         None => {
                             continue
@@ -996,6 +1010,25 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
             match event {
                 Event::ClientMessage(send_request) => {
                     let WorkerSendRequest { message, responder } = send_request;
+                    let cancellation_request_id = match &message {
+                        ClientJsonRpcMessage::Notification(notification) => {
+                            match &notification.notification {
+                                ClientNotification::CancelledNotification(cancelled) => {
+                                    cancelled.params.request_id.clone()
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if uses_modern_http && let Some(request_id) = cancellation_request_id {
+                        if let Some(stream_ct) = request_stream_cancellations.remove(&request_id) {
+                            stream_ct.cancel();
+                        }
+                        pending_stream_response_ids.remove(&request_id);
+                        let _ = responder.send(Ok(()));
+                        continue;
+                    }
                     let is_fallback_initialize = saved_init_request.is_none()
                         && matches!(
                             &message,
@@ -1016,6 +1049,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                 && streams.is_empty(),
                             "discover bootstrap must not create session state"
                         );
+                        uses_modern_http = false;
 
                         let response = self
                             .client
@@ -1213,15 +1247,17 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                                 );
                                                 Ok(())
                                             }
-                                            Ok(StreamableHttpPostResponse::Json(msg, ..)) => {
+                                            Ok(StreamableHttpPostResponse::Json(mut msg, ..)) => {
                                                 cache_tools_from_response(
                                                     &mut tool_header_cache,
-                                                    &msg,
+                                                    &mut msg,
+                                                    &negotiated_version,
                                                 );
                                                 context.send_to_handler(msg).await?;
                                                 Ok(())
                                             }
                                             Ok(StreamableHttpPostResponse::Sse(stream, ..)) => {
+                                                let stream_request_id = request_id.clone();
                                                 Self::mark_stream_response_pending(
                                                     &mut pending_stream_response_ids,
                                                     request_id,
@@ -1236,12 +1272,24 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                                     config.max_sse_event_size,
                                                     self.config.retry_config.clone(),
                                                 );
-                                                streams.spawn(Self::execute_sse_stream(
-                                                    sse_stream,
-                                                    sse_worker_tx.clone(),
-                                                    true,
-                                                    transport_task_ct.child_token(),
-                                                ));
+                                                let stream_ct = transport_task_ct.child_token();
+                                                if uses_modern_http
+                                                    && let Some(request_id) =
+                                                        stream_request_id.as_ref()
+                                                {
+                                                    request_stream_cancellations.insert(
+                                                        request_id.clone(),
+                                                        stream_ct.clone(),
+                                                    );
+                                                }
+                                                let stream_tx = sse_worker_tx.clone();
+                                                streams.spawn(async move {
+                                                    let result = Self::execute_sse_stream(
+                                                        sse_stream, stream_tx, true, stream_ct,
+                                                    )
+                                                    .await;
+                                                    (stream_request_id, result)
+                                                });
                                                 tracing::trace!("got new sse stream after re-init");
                                                 Ok(())
                                             }
@@ -1262,12 +1310,17 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             tracing::trace!("client message accepted");
                             Ok(())
                         }
-                        Ok(StreamableHttpPostResponse::Json(message, ..)) => {
-                            cache_tools_from_response(&mut tool_header_cache, &message);
+                        Ok(StreamableHttpPostResponse::Json(mut message, ..)) => {
+                            cache_tools_from_response(
+                                &mut tool_header_cache,
+                                &mut message,
+                                &negotiated_version,
+                            );
                             context.send_to_handler(message).await?;
                             Ok(())
                         }
                         Ok(StreamableHttpPostResponse::Sse(stream, ..)) => {
+                            let stream_request_id = request_id.clone();
                             Self::mark_stream_response_pending(
                                 &mut pending_stream_response_ids,
                                 request_id,
@@ -1282,12 +1335,20 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                 config.max_sse_event_size,
                                 self.config.retry_config.clone(),
                             );
-                            streams.spawn(Self::execute_sse_stream(
-                                sse_stream,
-                                sse_worker_tx.clone(),
-                                true,
-                                transport_task_ct.child_token(),
-                            ));
+                            let stream_ct = transport_task_ct.child_token();
+                            if uses_modern_http && let Some(request_id) = stream_request_id.as_ref()
+                            {
+                                request_stream_cancellations
+                                    .insert(request_id.clone(), stream_ct.clone());
+                            }
+                            let stream_tx = sse_worker_tx.clone();
+                            streams.spawn(async move {
+                                let result = Self::execute_sse_stream(
+                                    sse_stream, stream_tx, true, stream_ct,
+                                )
+                                .await;
+                                (stream_request_id, result)
+                            });
                             tracing::trace!("got new sse stream");
                             Ok(())
                         }
@@ -1311,18 +1372,49 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     }
                     let _ = responder.send(send_result);
                 }
-                Event::ServerMessage(json_rpc_message) => {
+                Event::ServerMessage(mut json_rpc_message) => {
+                    if let Some(response_id) = Self::server_response_id(&json_rpc_message)
+                        && let Some(stream_ct) = crate::service::remove_pending_request(
+                            &mut request_stream_cancellations,
+                            response_id,
+                        )
+                    {
+                        stream_ct.cancel();
+                    }
                     Self::clear_stream_response_pending(
                         &mut pending_stream_response_ids,
                         &json_rpc_message,
                     );
-                    cache_tools_from_response(&mut tool_header_cache, &json_rpc_message);
+                    cache_tools_from_response(
+                        &mut tool_header_cache,
+                        &mut json_rpc_message,
+                        &negotiated_version,
+                    );
                     // send the message to the handler
                     if let Err(e) = context.send_to_handler(json_rpc_message).await {
                         break 'main_loop Err(e);
                     }
                 }
-                Event::StreamResult(result) => {
+                Event::StreamResult { request_id, result } => {
+                    if let Some(request_id) = request_id {
+                        Self::drain_queued_stream_messages(
+                            &mut sse_worker_rx,
+                            &mut context,
+                            &mut pending_stream_response_ids,
+                        )
+                        .await?;
+                        request_stream_cancellations.remove(&request_id);
+                        if pending_stream_response_ids.remove(&request_id) {
+                            context
+                                .send_to_handler(ServerJsonRpcMessage::error(
+                                    ErrorData::transport_closed(
+                                        "streamable HTTP response stream closed before its final response",
+                                    ),
+                                    Some(request_id),
+                                ))
+                                .await?;
+                        }
+                    }
                     if result.is_err() {
                         tracing::warn!(
                             "sse client event stream terminated with error: {:?}",
@@ -1453,7 +1545,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
 ///     async fn get_stream(
 ///         &self,
 ///         _uri: Arc<str>,
-///         _session_id: Arc<str>,
+///         _session_id: Option<Arc<str>>,
 ///         _last_event_id: Option<String>,
 ///         _auth_header: Option<String>,
 ///         _custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -1540,7 +1632,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientTransport<C> {
     ///     async fn get_stream(
     ///         &self,
     ///         _uri: Arc<str>,
-    ///         _session_id: Arc<str>,
+    ///         _session_id: Option<Arc<str>>,
     ///         _last_event_id: Option<String>,
     ///         _auth_header: Option<String>,
     ///         _custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -1667,5 +1759,222 @@ impl Default for StreamableHttpClientTransportConfig {
             max_sse_event_size: DEFAULT_MAX_SSE_EVENT_SIZE,
             reinit_on_expired_session: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::model::{ListToolsResult, NumberOrString, ServerResult, Tool};
+
+    type ReconnectAttempt = (Option<String>, Option<String>);
+
+    #[derive(Clone, Default)]
+    struct StatelessReconnectClient {
+        reconnects: Arc<Mutex<Vec<ReconnectAttempt>>>,
+    }
+
+    impl StreamableHttpClient for StatelessReconnectClient {
+        type Error = std::io::Error;
+
+        async fn post_message(
+            &self,
+            _uri: Arc<str>,
+            _message: ClientJsonRpcMessage,
+            _session_id: Option<Arc<str>>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+            Err(StreamableHttpError::UnexpectedServerResponse(
+                "unexpected POST".into(),
+            ))
+        }
+
+        async fn delete_session(
+            &self,
+            _uri: Arc<str>,
+            _session_id: Arc<str>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<(), StreamableHttpError<Self::Error>> {
+            Ok(())
+        }
+
+        async fn get_stream(
+            &self,
+            _uri: Arc<str>,
+            session_id: Option<Arc<str>>,
+            last_event_id: Option<String>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<BoxedSseStream, StreamableHttpError<Self::Error>> {
+            self.reconnects
+                .lock()
+                .expect("lock reconnects")
+                .push((session_id.map(|id| id.to_string()), last_event_id));
+            let response = ServerJsonRpcMessage::response(
+                ServerResult::ListToolsResult(ListToolsResult::default()),
+                NumberOrString::Number(1),
+            );
+            Ok(futures::stream::once(async move {
+                Ok(Sse {
+                    event: None,
+                    data: Some(serde_json::to_string(&response).expect("serialize response")),
+                    id: Some("event-1".into()),
+                    retry: None,
+                })
+            })
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn stateless_response_reconnects_with_last_event_id() {
+        let initial = futures::stream::iter([Ok(Sse {
+            event: None,
+            data: None,
+            id: Some("event-0".into()),
+            retry: Some(0),
+        })])
+        .boxed();
+        let client = StatelessReconnectClient::default();
+        let reconnects = client.reconnects.clone();
+        let stream =
+            StreamableHttpClientWorker::<StatelessReconnectClient>::response_sse_to_jsonrpc(
+                initial,
+                None,
+                client,
+                Arc::from("http://localhost/mcp"),
+                None,
+                HashMap::new(),
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+                Arc::new(ExponentialBackoff {
+                    max_times: Some(1),
+                    base_duration: Duration::ZERO,
+                }),
+            );
+        let mut stream = std::pin::pin!(stream);
+
+        let message = stream.next().await.expect("replayed response").unwrap();
+
+        assert!(matches!(message, ServerJsonRpcMessage::Response(_)));
+        assert_eq!(
+            reconnects.lock().expect("lock reconnects").as_slice(),
+            &[(None, Some("event-0".into()))]
+        );
+    }
+
+    fn tool(name: &'static str, annotation: serde_json::Value) -> Tool {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "value": annotation,
+            },
+        });
+        Tool::new(
+            name,
+            name,
+            Arc::new(schema.as_object().expect("object schema").clone()),
+        )
+    }
+
+    #[test]
+    fn cache_tools_removes_invalid_header_annotations() {
+        let valid = tool(
+            "valid",
+            json!({ "type": "string", "x-mcp-header": "Value" }),
+        );
+        let invalid = tool("invalid", json!({ "type": "string", "x-mcp-header": "" }));
+        let mut message = ServerJsonRpcMessage::response(
+            ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![valid, invalid])),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+
+        cache_tools_from_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+
+        let ServerJsonRpcMessage::Response(response) = &mut message else {
+            panic!("expected tools/list response");
+        };
+        let ServerResult::ListToolsResult(result) = &mut response.result else {
+            panic!("expected tools/list result");
+        };
+        assert_eq!(
+            (
+                result
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_ref())
+                    .collect::<Vec<_>>(),
+                cache.keys().map(String::as_str).collect::<Vec<_>>(),
+            ),
+            (vec!["valid"], vec!["valid"])
+        );
+    }
+
+    #[test]
+    fn cache_tools_preserves_pre_standard_header_results() {
+        let invalid = tool("legacy", json!({ "type": "string", "x-mcp-header": "" }));
+        let mut message = ServerJsonRpcMessage::response(
+            ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![invalid])),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+
+        cache_tools_from_response(&mut cache, &mut message, &ProtocolVersion::V_2025_11_25);
+
+        let ServerJsonRpcMessage::Response(response) = message else {
+            panic!("expected tools/list response");
+        };
+        let ServerResult::ListToolsResult(result) = response.result else {
+            panic!("expected tools/list result");
+        };
+        assert_eq!(
+            result
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["legacy"]
+        );
+    }
+
+    #[cfg(feature = "transport-streamable-http-client-reqwest")]
+    #[test]
+    fn clear_stream_response_pending_accepts_stringified_numeric_id() {
+        let mut pending = HashSet::from([NumberOrString::Number(1)]);
+        let response = ServerJsonRpcMessage::response(
+            ServerResult::ListToolsResult(ListToolsResult::default()),
+            NumberOrString::String("1".into()),
+        );
+
+        StreamableHttpClientWorker::<reqwest::Client>::clear_stream_response_pending(
+            &mut pending,
+            &response,
+        );
+
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(feature = "transport-streamable-http-client-reqwest")]
+    #[test]
+    fn clear_stream_response_pending_prefers_exact_string_id() {
+        let string_id = NumberOrString::String("1".into());
+        let mut pending = HashSet::from([NumberOrString::Number(1), string_id.clone()]);
+        let response = ServerJsonRpcMessage::response(
+            ServerResult::ListToolsResult(ListToolsResult::default()),
+            string_id,
+        );
+
+        StreamableHttpClientWorker::<reqwest::Client>::clear_stream_response_pending(
+            &mut pending,
+            &response,
+        );
+
+        assert_eq!(pending, HashSet::from([NumberOrString::Number(1)]));
     }
 }
