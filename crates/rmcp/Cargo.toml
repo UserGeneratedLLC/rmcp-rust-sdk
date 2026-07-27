@@ -77,7 +77,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
   "stream",
 ], optional = true }
 
-sse-stream = { version = "0.2.4", optional = true }
+sse-stream = { version = "0.2.5", optional = true }
 
 http = { version = "1", optional = true }
 url = { version = "2.5", optional = true }
@@ -200,7 +200,7 @@ schemars = ["dep:schemars"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-schemars = { version = "1.2.1", features = ["chrono04"] }
+schemars = { version = "1.2.2", features = ["chrono04"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
