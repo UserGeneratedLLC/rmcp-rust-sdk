@@ -70,20 +70,19 @@ impl OAuthHttpRequest {
     }
 }
 
-/// Error returned by a custom OAuth HTTP client.
-#[derive(Debug, Error)]
-#[error("{message}")]
-pub struct OAuthHttpClientError {
-    message: String,
-}
+/// Type-erased error returned by an [`OAuthHttpClient`].
+pub type OAuthHttpClientError = Box<dyn std::error::Error + Send + Sync>;
 
-impl OAuthHttpClientError {
-    /// Create an error from a transport-provided message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
+#[derive(Debug, Error)]
+enum OAuthHttpError {
+    #[error("OAuth HTTP response body exceeds {0} bytes")]
+    ResponseBodyTooLarge(usize),
+    #[error("unexpected HTTP status {0}")]
+    UnexpectedStatus(StatusCode),
+    #[error("OAuth discovery redirect to non-same-origin URL rejected: {0}")]
+    CrossOriginRedirect(Url),
+    #[error("OAuth discovery exceeded {0} redirects")]
+    TooManyRedirects(usize),
 }
 
 /// Future returned by [`OAuthHttpClient::execute`].
@@ -132,11 +131,11 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
                 OAuthHttpRedirectPolicy::Stop => &self.stop_redirects,
             };
             let request = reqwest::Request::try_from(request)
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| Box::new(error) as OAuthHttpClientError)?;
             let response = client
                 .execute(request)
                 .await
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| Box::new(error) as OAuthHttpClientError)?;
 
             let mut builder = oauth2::http::Response::builder()
                 .status(response.status())
@@ -147,17 +146,17 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
             let mut body = Vec::new();
             let mut body_stream = response.bytes_stream();
             while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                let chunk = chunk.map_err(|error| Box::new(error) as OAuthHttpClientError)?;
                 if chunk.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES - body.len() {
-                    return Err(OAuthHttpClientError::new(format!(
-                        "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
-                    )));
+                    return Err(Box::new(OAuthHttpError::ResponseBodyTooLarge(
+                        MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES,
+                    )) as OAuthHttpClientError);
                 }
                 body.extend_from_slice(&chunk);
             }
             builder
                 .body(body)
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))
+                .map_err(|error| Box::new(error) as OAuthHttpClientError)
         })
     }
 }
@@ -167,16 +166,35 @@ struct OAuth2HttpClient<'a> {
     redirect_policy: OAuthHttpRedirectPolicy,
 }
 
+#[derive(Debug)]
+struct OAuth2HttpClientError(OAuthHttpClientError);
+
+impl std::fmt::Display for OAuth2HttpClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OAuth HTTP request failed")
+    }
+}
+
+impl std::error::Error for OAuth2HttpClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 impl<'c> AsyncHttpClient<'c> for OAuth2HttpClient<'_> {
-    type Error = OAuthHttpClientError;
+    type Error = OAuth2HttpClientError;
 
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<HttpResponse, Self::Error>> + Send + 'c>,
     >;
 
     fn call(&'c self, request: HttpRequest) -> Self::Future {
-        self.client
-            .execute(OAuthHttpRequest::new(request, self.redirect_policy))
+        Box::pin(async move {
+            self.client
+                .execute(OAuthHttpRequest::new(request, self.redirect_policy))
+                .await
+                .map_err(OAuth2HttpClientError)
+        })
     }
 }
 
@@ -589,7 +607,7 @@ pub enum AuthorizationMetadataSource {
     /// [Newer MCP revisions] require metadata discovery and do not define an
     /// endpoint-synthesis fallback.
     ///
-    /// [Newer MCP revisions]: https://modelcontextprotocol.io/specification/draft/basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements
+    /// [Newer MCP revisions]: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements
     LegacyEndpointFallback,
 }
 
@@ -687,7 +705,7 @@ impl OAuthClientConfig {
 /// Declarative description of the client identity material available for an
 /// authorization flow.
 ///
-/// The [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+/// The [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration)
 /// recommends that clients obtain a client ID using the following priority
 /// order. [`OAuthState::start_authorization`] and [`AuthorizationSession::new`]
 /// apply it internally:
@@ -1011,6 +1029,8 @@ pub struct AuthorizationManager {
     www_auth_scopes: RwLock<Vec<String>>,
     /// scopes_supported from protected resource metadata (RFC 9728)
     resource_scopes: RwLock<Vec<String>>,
+    /// resource indicator from protected resource metadata, used for RFC 8707 `resource`
+    discovered_resource: RwLock<Option<String>>,
     /// OIDC Dynamic Client Registration `application_type` (SEP-837)
     application_type: Option<String>,
     allow_missing_issuer: bool,
@@ -1258,6 +1278,7 @@ impl AuthorizationManager {
             scope_upgrade_config: ScopeUpgradeConfig::default(),
             www_auth_scopes: RwLock::new(Vec::new()),
             resource_scopes: RwLock::new(Vec::new()),
+            discovered_resource: RwLock::new(None),
             application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
             allow_missing_issuer: false,
         };
@@ -1727,7 +1748,7 @@ impl AuthorizationManager {
         let mut auth_request = oauth_client
             .authorize_url(CsrfToken::new_random)
             .set_pkce_challenge(pkce_challenge)
-            .add_extra_param("resource", self.base_url.to_string());
+            .add_extra_param("resource", self.oauth_resource().await);
 
         // add request scopes
         for scope in scopes {
@@ -1763,6 +1784,14 @@ impl AuthorizationManager {
             .await?;
 
         Ok(auth_url.to_string())
+    }
+
+    async fn oauth_resource(&self) -> String {
+        self.discovered_resource
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| self.base_url.to_string())
     }
 
     /// get the current granted scopes
@@ -2006,7 +2035,7 @@ impl AuthorizationManager {
         let token_result = match oauth_client
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .set_pkce_verifier(pkce_verifier)
-            .add_extra_param("resource", self.base_url.to_string())
+            .add_extra_param("resource", self.oauth_resource().await)
             .request_async(&OAuth2HttpClient {
                 client: self.http_client.as_ref(),
                 redirect_policy: OAuthHttpRedirectPolicy::Stop,
@@ -2151,7 +2180,7 @@ impl AuthorizationManager {
         let mut refresh_request = oauth_client
             .exchange_refresh_token(&refresh_token_value)
             // RFC 8707: the resource indicator is required on token requests, including refreshes
-            .add_extra_param("resource", self.base_url.to_string());
+            .add_extra_param("resource", self.oauth_resource().await);
         let mut refresh_scopes = stored_credentials.granted_scopes;
         self.add_offline_access_if_supported(&mut refresh_scopes);
         for scope in refresh_scopes {
@@ -2283,13 +2312,10 @@ impl AuthorizationManager {
         discovery_url: &Url,
     ) -> Result<Option<AuthorizationMetadata>, AuthError> {
         debug!("discovery url: {:?}", discovery_url);
-        let response = match self.discovery_get(discovery_url).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("discovery request failed: {}", e);
-                return Ok(None);
-            }
-        };
+        let response = self
+            .discovery_get(discovery_url)
+            .await
+            .map_err(|error| Self::discovery_failed(discovery_url, error))?;
 
         if response.status() != StatusCode::OK {
             debug!("discovery returned non-200: {}", response.status());
@@ -2387,7 +2413,7 @@ impl AuthorizationManager {
     async fn discover_oauth_server_via_resource_metadata(
         &self,
     ) -> Result<Option<AuthorizationMetadata>, AuthError> {
-        let Some(resource_metadata_url) = self.discover_resource_metadata_url().await else {
+        let Some(resource_metadata_url) = self.discover_resource_metadata_url().await? else {
             return Ok(None);
         };
         self.discover_oauth_server_from_resource_metadata_url(&resource_metadata_url)
@@ -2406,6 +2432,11 @@ impl AuthorizationManager {
         };
 
         self.validate_resource_metadata_resource(&resource_metadata)?;
+
+        self.discovered_resource
+            .write()
+            .await
+            .replace(resource_metadata.resource.clone().unwrap_or_default());
 
         // store scopes_supported from protected resource metadata for select_scopes()
         if let Some(scopes) = resource_metadata.scopes_supported
@@ -2470,9 +2501,21 @@ impl AuthorizationManager {
             ));
         };
 
-        if !Self::resource_identifiers_match(self.base_url.as_str(), resource) {
+        let Ok(resource_url) = Url::parse(resource) else {
+            return Err(AuthError::MetadataError(
+                "Protected resource metadata resource field is not a valid URL".to_string(),
+            ));
+        };
+
+        if resource_url.fragment().is_some() {
+            return Err(AuthError::MetadataError(
+                "Protected resource metadata resource does not permit fragment in URL as specified by RFC 8707".to_string()
+            ));
+        }
+
+        if !Self::is_resource_identifier_valid(&self.base_url, &resource_url) {
             return Err(AuthError::MetadataError(format!(
-                "Protected resource metadata resource mismatch: expected '{}', got '{}'",
+                "Protected resource metadata resource mismatch: reference '{}', permitted '{}'",
                 self.base_url, resource
             )));
         }
@@ -2480,39 +2523,38 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn resource_identifiers_match(expected: &str, actual: &str) -> bool {
-        expected == actual
-            || (Self::is_root_resource_identifier(expected)
-                && actual == expected.trim_end_matches('/'))
-            || (Self::is_root_resource_identifier(actual)
-                && expected == actual.trim_end_matches('/'))
-            || Self::root_resource_identifier_covers_path(actual, expected)
-    }
+    fn is_resource_identifier_valid(expected: &Url, actual: &Url) -> bool {
+        if expected == actual {
+            return true;
+        }
 
-    fn is_root_resource_identifier(value: &str) -> bool {
-        Url::parse(value)
-            .is_ok_and(|url| url.path() == "/" && url.query().is_none() && url.fragment().is_none())
-    }
-
-    fn root_resource_identifier_covers_path(root_resource: &str, path_resource: &str) -> bool {
-        let Ok(root_resource) = Url::parse(root_resource) else {
-            return false;
-        };
-        let Ok(path_resource) = Url::parse(path_resource) else {
-            return false;
-        };
-
-        root_resource.path() == "/"
-            && root_resource.query().is_none()
-            && root_resource.fragment().is_none()
-            && path_resource.path() != "/"
-            && Self::is_same_origin(&root_resource, &path_resource)
-    }
-
-    async fn discover_resource_metadata_url(&self) -> Option<Url> {
-        if let Some(resource_metadata_url) = self.probe_resource_metadata_url(&self.base_url).await
+        if expected.scheme() != actual.scheme()
+            || expected.host_str() != actual.host_str()
+            || expected.port_or_known_default() != actual.port_or_known_default()
         {
-            return Some(resource_metadata_url);
+            return false;
+        }
+
+        let expected_path = expected.path();
+        let actual_path = actual.path();
+
+        // URL query part supported, even if it is discouraged in RFC 8707
+        if expected_path == actual_path && expected.query() == actual.query() {
+            return true;
+        }
+
+        expected_path.starts_with(actual_path)
+            && expected.query().is_none()
+            && actual.query().is_none()
+            && (actual_path.ends_with('/')
+                || expected_path.as_bytes().get(actual_path.len()) == Some(&b'/'))
+    }
+
+    async fn discover_resource_metadata_url(&self) -> Result<Option<Url>, AuthError> {
+        if let Some(resource_metadata_url) =
+            self.probe_resource_metadata_url(&self.base_url).await?
+        {
+            return Ok(Some(resource_metadata_url));
         }
 
         // If the primary URL doesn't use WWW-Authenticate, try oauth-protected-resource discovery.
@@ -2525,37 +2567,33 @@ impl AuthorizationManager {
             discovery_url.set_fragment(None);
             discovery_url.set_path(&candidate_path);
             if let Some(resource_metadata_url) =
-                self.probe_resource_metadata_url(&discovery_url).await
+                self.probe_resource_metadata_url(&discovery_url).await?
             {
-                return Some(resource_metadata_url);
+                return Ok(Some(resource_metadata_url));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Probe `url` with a GET, extracting the resource metadata url from a
     /// 200 (the url itself is the metadata document) or from a 401's
     /// WWW-Authenticate header value.
     /// https://www.rfc-editor.org/rfc/rfc9728.html#name-use-of-www-authenticate-for
-    async fn probe_resource_metadata_url(&self, url: &Url) -> Option<Url> {
-        let response = match self.discovery_get(url).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("resource metadata probe failed: {}", e);
-                return None;
-            }
-        };
+    async fn probe_resource_metadata_url(&self, url: &Url) -> Result<Option<Url>, AuthError> {
+        let response = self
+            .discovery_get(url)
+            .await
+            .map_err(|error| Self::discovery_failed(url, error))?;
 
         match response.status() {
-            StatusCode::OK => Some(url.clone()),
-            StatusCode::UNAUTHORIZED => {
-                self.extract_resource_metadata_url_from_www_authenticate(&response)
-                    .await
-            }
+            StatusCode::OK => Ok(Some(url.clone())),
+            StatusCode::UNAUTHORIZED => Ok(self
+                .extract_resource_metadata_url_from_www_authenticate(&response)
+                .await),
             status => {
                 debug!("resource metadata probe returned unexpected status: {status}");
-                None
+                Ok(None)
             }
         }
     }
@@ -2588,13 +2626,10 @@ impl AuthorizationManager {
             "resource metadata discovery url: {:?}",
             resource_metadata_url
         );
-        let response = match self.discovery_get(resource_metadata_url).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("resource metadata request failed: {}", e);
-                return Ok(None);
-            }
-        };
+        let response = self
+            .discovery_get(resource_metadata_url)
+            .await
+            .map_err(|error| Self::discovery_failed(resource_metadata_url, error))?;
 
         if response.status() != StatusCode::OK {
             debug!(
@@ -2614,6 +2649,30 @@ impl AuthorizationManager {
         Ok(Some(metadata))
     }
 
+    fn discovery_failed(url: &Url, error: OAuthHttpClientError) -> AuthError {
+        AuthError::MetadataError(format!(
+            "OAuth metadata discovery failed for {url}\n  Caused by: {}",
+            crate::error::ErrorChain(error.as_ref())
+        ))
+    }
+
+    async fn discovery_request(
+        &self,
+        request: OAuthHttpRequest,
+    ) -> Result<HttpResponse, OAuthHttpClientError> {
+        let response = self.http_client.execute(request).await?;
+        let status = response.status();
+        if status.is_server_error()
+            || matches!(
+                status,
+                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+            )
+        {
+            return Err(Box::new(OAuthHttpError::UnexpectedStatus(status)));
+        }
+        Ok(response)
+    }
+
     async fn discovery_get(&self, url: &Url) -> Result<HttpResponse, OAuthHttpClientError> {
         let mut current_url = url.clone();
         for _ in 0..MAX_OAUTH_DISCOVERY_REDIRECTS {
@@ -2622,10 +2681,9 @@ impl AuthorizationManager {
                 .uri(current_url.as_str())
                 .header(HEADER_MCP_PROTOCOL_VERSION, "2024-11-05")
                 .body(Vec::new())
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| Box::new(error) as OAuthHttpClientError)?;
             let response = self
-                .http_client
-                .execute(OAuthHttpRequest::new(
+                .discovery_request(OAuthHttpRequest::new(
                     request,
                     OAuthHttpRedirectPolicy::Stop,
                 ))
@@ -2640,23 +2698,21 @@ impl AuthorizationManager {
             };
             let location = location
                 .to_str()
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| Box::new(error) as OAuthHttpClientError)?;
             let next_url = current_url
                 .join(location)
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| Box::new(error) as OAuthHttpClientError)?;
 
             if Self::is_http_url(&next_url) && Self::is_same_origin(&current_url, &next_url) {
                 current_url = next_url;
                 continue;
             }
 
-            return Err(OAuthHttpClientError::new(format!(
-                "OAuth discovery redirect to non-same-origin URL rejected: {next_url}"
-            )));
+            return Err(Box::new(OAuthHttpError::CrossOriginRedirect(next_url)));
         }
 
-        Err(OAuthHttpClientError::new(format!(
-            "OAuth discovery exceeded {MAX_OAUTH_DISCOVERY_REDIRECTS} redirects"
+        Err(Box::new(OAuthHttpError::TooManyRedirects(
+            MAX_OAUTH_DISCOVERY_REDIRECTS,
         )))
     }
 
@@ -3189,7 +3245,7 @@ pub struct AuthorizationSession {
 
 impl AuthorizationSession {
     /// Create a new authorization session, selecting a client registration
-    /// mechanism per the [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+    /// mechanism per the [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration)
     /// priority order:
     ///
     /// 1. Pre-registered client information
@@ -3544,7 +3600,7 @@ impl OAuthState {
     /// Start authorization.
     ///
     /// Selects a client registration mechanism from the identity material in
-    /// `request`, following the [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+    /// `request`, following the [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration)
     /// priority order:
     ///
     /// 1. Pre-registered client information
@@ -3794,6 +3850,7 @@ mod tests {
     };
 
     use oauth2::{AuthType, CsrfToken, HttpResponse, PkceCodeVerifier};
+    use reqwest::StatusCode;
     use rstest::rstest;
     use url::Url;
 
@@ -3842,9 +3899,7 @@ mod tests {
                 body: request.request.body().clone(),
             });
             let response = self.responses.lock().unwrap().pop_front();
-            Box::pin(async move {
-                response.ok_or_else(|| OAuthHttpClientError::new("missing fake response"))
-            })
+            Box::pin(async move { response.ok_or_else(|| "missing fake response".into()) })
         }
     }
 
@@ -3870,6 +3925,167 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn oauth_http_client_error_preserves_source_chain() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("request failed")]
+        struct RequestError(#[source] std::io::Error);
+
+        let error: OAuthHttpClientError = RequestError(std::io::Error::other(
+            "certificate signed by unknown authority",
+        ))
+        .into();
+        assert!(error.downcast_ref::<RequestError>().is_some());
+
+        let url = Url::parse("https://mcp.example.com/mcp").unwrap();
+        let error = AuthorizationManager::discovery_failed(&url, error);
+        assert_eq!(
+            error.to_string(),
+            "Metadata error: OAuth metadata discovery failed for https://mcp.example.com/mcp\n  Caused by: request failed\n  Caused by: certificate signed by unknown authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_http_client_preserves_connection_failure_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        drop(listener);
+
+        let manager = AuthorizationManager::new(&url).await.unwrap();
+        let error = manager.resolve_metadata().await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AuthError::MetadataError(ref reason)
+                    if reason.contains(&url)
+                        && reason.contains("\n  Caused by: error sending request for url")
+                        && reason.matches("error sending request for url").count() == 1
+                        && reason.to_ascii_lowercase().contains("connection refused")
+            ),
+            "unexpected discovery error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_metadata_propagates_transport_failure() {
+        let responses = preregistered_discovery_responses()
+            .into_iter()
+            .take(2)
+            .collect();
+        let client = RecordingOAuthHttpClient::with_responses(responses);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let error = manager.resolve_metadata().await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AuthError::MetadataError(ref reason)
+                    if reason.contains("https://auth.example.com/.well-known/oauth-authorization-server")
+                        && reason.contains("missing fake response")
+            ),
+            "unexpected discovery error: {error}"
+        );
+        assert_eq!(client.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn discovery_propagates_server_errors() {
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(RecordingOAuthHttpClient::with_responses(vec![
+                empty_response(503),
+            ])),
+        )
+        .await
+        .unwrap();
+
+        let error = manager.resolve_metadata().await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AuthError::MetadataError(ref reason)
+                    if reason.contains("https://mcp.example.com/mcp") && reason.contains("503")
+            ),
+            "unexpected discovery error: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::resource_request_timeout(StatusCode::REQUEST_TIMEOUT, 0, "https://mcp.example.com/mcp")]
+    #[case::resource_too_early(StatusCode::TOO_EARLY, 0, "https://mcp.example.com/mcp")]
+    #[case::resource_too_many_requests(
+        StatusCode::TOO_MANY_REQUESTS,
+        0,
+        "https://mcp.example.com/mcp"
+    )]
+    #[case::protected_metadata_request_timeout(
+        StatusCode::REQUEST_TIMEOUT,
+        1,
+        "https://mcp.example.com/.well-known/oauth-protected-resource"
+    )]
+    #[case::protected_metadata_too_early(
+        StatusCode::TOO_EARLY,
+        1,
+        "https://mcp.example.com/.well-known/oauth-protected-resource"
+    )]
+    #[case::protected_metadata_too_many_requests(
+        StatusCode::TOO_MANY_REQUESTS,
+        1,
+        "https://mcp.example.com/.well-known/oauth-protected-resource"
+    )]
+    #[case::authorization_request_timeout(
+        StatusCode::REQUEST_TIMEOUT,
+        2,
+        "https://auth.example.com/.well-known/oauth-authorization-server"
+    )]
+    #[case::authorization_too_early(
+        StatusCode::TOO_EARLY,
+        2,
+        "https://auth.example.com/.well-known/oauth-authorization-server"
+    )]
+    #[case::authorization_too_many_requests(
+        StatusCode::TOO_MANY_REQUESTS,
+        2,
+        "https://auth.example.com/.well-known/oauth-authorization-server"
+    )]
+    #[tokio::test]
+    async fn discovery_propagates_transient_client_errors(
+        #[case] status: StatusCode,
+        #[case] successful_response_count: usize,
+        #[case] expected_url: &str,
+    ) {
+        let mut responses = preregistered_discovery_responses();
+        responses.insert(successful_response_count, empty_response(status.as_u16()));
+
+        let client = RecordingOAuthHttpClient::with_responses(responses);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let error = manager.resolve_metadata().await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AuthError::MetadataError(ref reason)
+                    if reason.contains(expected_url) && reason.contains(status.as_str())
+            ),
+            "unexpected discovery error for {status}: {error}"
+        );
+        assert_eq!(client.requests().len(), successful_response_count + 1);
+    }
+
     #[tokio::test]
     async fn custom_http_client_handles_protected_resource_discovery() {
         let challenge = oauth2::http::Response::builder()
@@ -3885,7 +4101,7 @@ mod tests {
             http_response(
                 200,
                 serde_json::json!({
-                    "resource": "https://mcp.example.com/mcp",
+                    "resource": "https://mcp.example.com",
                     "authorization_servers": ["https://auth.example.com"]
                 }),
             ),
@@ -3909,6 +4125,10 @@ mod tests {
 
         assert_eq!(metadata.token_endpoint, "https://auth.example.com/token");
         assert_eq!(
+            manager.discovered_resource.read().await.as_deref(),
+            Some("https://mcp.example.com")
+        );
+        assert_eq!(
             client.requests(),
             vec![
                 RecordedOAuthRequest {
@@ -3931,6 +4151,110 @@ mod tests {
                     body: Vec::new(),
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_uses_discovered_protected_resource() {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            challenge,
+            http_response(
+                200,
+                serde_json::json!({
+                    "resource": "https://mcp.example.com",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            http_response(
+                200,
+                serde_json::json!({
+                    "issuer": "https://auth.example.com",
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token",
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"]
+                }),
+            ),
+            http_response(
+                200,
+                serde_json::json!({
+                    "access_token": "initial-access-token",
+                    "token_type": "bearer",
+                    "refresh_token": "initial-refresh-token",
+                    "expires_in": 3600
+                }),
+            ),
+            http_response(
+                200,
+                serde_json::json!({
+                    "access_token": "refreshed-access-token",
+                    "token_type": "bearer",
+                    "refresh_token": "refreshed-refresh-token",
+                    "expires_in": 3600
+                }),
+            ),
+        ]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let resolution = manager.resolve_metadata().await.unwrap();
+        manager.set_metadata(resolution.metadata);
+        manager.configure_client_id("test-client-id").unwrap();
+
+        let authorization_url = manager.get_authorization_url(&[]).await.unwrap();
+        let authorization_params: HashMap<String, String> = Url::parse(&authorization_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let state = authorization_params.get("state").unwrap();
+
+        manager
+            .exchange_code_for_token("authorization-code", state)
+            .await
+            .unwrap();
+        manager.refresh_token().await.unwrap();
+
+        let token_requests: Vec<HashMap<String, String>> = client
+            .requests()
+            .into_iter()
+            .filter(|request| request.uri == "https://auth.example.com/token")
+            .map(|request| {
+                url::form_urlencoded::parse(&request.body)
+                    .into_owned()
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(token_requests.len(), 2);
+        assert_eq!(
+            token_requests[0].get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            token_requests[1].get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            [
+                authorization_params.get("resource").map(String::as_str),
+                token_requests[0].get("resource").map(String::as_str),
+                token_requests[1].get("resource").map(String::as_str),
+            ],
+            [Some("https://mcp.example.com"); 3],
+            "authorization, code exchange, and refresh must use the discovered resource audience"
         );
     }
 
@@ -4213,13 +4537,18 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::not_found(StatusCode::NOT_FOUND)]
+    #[case::method_not_allowed(StatusCode::METHOD_NOT_ALLOWED)]
     #[tokio::test]
-    async fn resolve_metadata_reports_legacy_fallback_when_nothing_is_discovered() {
+    async fn resolve_metadata_reports_legacy_fallback_when_nothing_is_discovered(
+        #[case] status: StatusCode,
+    ) {
         let client = RecordingOAuthHttpClient::with_responses(vec![
-            empty_response(404),
-            empty_response(404),
-            empty_response(404),
-            empty_response(404),
+            empty_response(status.as_u16()),
+            empty_response(status.as_u16()),
+            empty_response(status.as_u16()),
+            empty_response(status.as_u16()),
         ]);
         let manager = AuthorizationManager::new_with_oauth_http_client(
             "https://legacy.example.com/",
@@ -5130,35 +5459,55 @@ mod tests {
     }
 
     #[test]
-    fn resource_identifier_matching_allows_only_root_trailing_slash_difference() {
-        assert!(AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com/",
-            "https://mcp.example.com"
+    fn resource_identifier_matching_allows_matching_host_or_parent_path() {
+        assert!(AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/").unwrap(),
+            &Url::parse("https://mcp.example.com").unwrap()
         ));
-        assert!(AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com",
-            "https://mcp.example.com/"
+        assert!(AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com").unwrap(),
+            &Url::parse("https://mcp.example.com/").unwrap()
         ));
-        assert!(AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com/mcp",
-            "https://mcp.example.com"
+        assert!(AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            &Url::parse("https://mcp.example.com").unwrap()
+        ));
+        assert!(AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp/tools").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp").unwrap()
+        ));
+        assert!(AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp?query=param").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp?query=param").unwrap()
         ));
 
-        assert!(!AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com/mcp",
-            "https://mcp.example.com/mcp/"
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp/").unwrap()
         ));
-        assert!(!AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com/mcp",
-            "https://real.example.com/mcp"
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp-tools").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp").unwrap()
         ));
-        assert!(!AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com/mcp",
-            "https://real.example.com"
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp-tools").unwrap()
         ));
-        assert!(!AuthorizationManager::resource_identifiers_match(
-            "https://mcp.example.com/mcp",
-            "https://mcp.example.com?resource=mcp"
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp/tools").unwrap()
+        ));
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            &Url::parse("https://real.example.com/mcp").unwrap()
+        ));
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp?query=value1").unwrap()
+        ));
+        assert!(!AuthorizationManager::is_resource_identifier_valid(
+            &Url::parse("https://mcp.example.com/mcp?query=value1").unwrap(),
+            &Url::parse("https://mcp.example.com/mcp?query=value2").unwrap()
         ));
     }
 
@@ -6116,6 +6465,64 @@ mod tests {
             .unwrap_or_default();
         assert!(scope.contains("read"));
         assert!(scope.contains("write"));
+    }
+
+    #[tokio::test]
+    async fn authorization_url_uses_discovered_resource() {
+        let base_url = "https://mcp.example.com/mcp";
+        let auth_endpoint = "https://auth.example.com/authorize";
+        let mut manager = AuthorizationManager::new(base_url).await.unwrap();
+
+        let metadata = AuthorizationMetadata {
+            authorization_endpoint: auth_endpoint.to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            registration_endpoint: None,
+            issuer: None,
+            jwks_uri: None,
+            scopes_supported: None,
+            response_types_supported: Some(vec!["code".to_string()]),
+            code_challenge_methods_supported: Some(vec!["S256".to_string()]),
+            additional_fields: std::collections::HashMap::new(),
+        };
+        manager.set_metadata(metadata);
+        manager.configure_client_id("test-client-id").unwrap();
+        *manager.discovered_resource.write().await = Some("https://mcp.example.com".to_string());
+
+        let auth_url = manager.get_authorization_url(&["read"]).await.unwrap();
+        let parsed = Url::parse(&auth_url).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+
+        assert_eq!(
+            params.get("resource").map(|v| v.as_ref()),
+            Some("https://mcp.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_url_uses_default_resource_without_protected_resource_document() {
+        let base_url = "https://mcp.example.com/mcp";
+        let auth_endpoint = "https://auth.example.com/authorize";
+        let mut manager = AuthorizationManager::new(base_url).await.unwrap();
+
+        let metadata = AuthorizationMetadata {
+            authorization_endpoint: auth_endpoint.to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            registration_endpoint: None,
+            issuer: None,
+            jwks_uri: None,
+            scopes_supported: None,
+            response_types_supported: Some(vec!["code".to_string()]),
+            code_challenge_methods_supported: Some(vec!["S256".to_string()]),
+            additional_fields: std::collections::HashMap::new(),
+        };
+        manager.set_metadata(metadata);
+        manager.configure_client_id("test-client-id").unwrap();
+
+        let auth_url = manager.get_authorization_url(&["read"]).await.unwrap();
+        let parsed = Url::parse(&auth_url).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+
+        assert_eq!(params.get("resource").map(|v| v.as_ref()), Some(base_url));
     }
 
     #[test]

@@ -59,13 +59,13 @@ pastey = { version = "0.2.3", optional = true }
 # oauth2 support
 oauth2 = { version = "5.0", optional = true, default-features = false }
 # JWT signing for client credentials (private_key_jwt)
-jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", optional = true, features = ["aws_lc_rs"] }
 
 # for auto generate schema
 schemars = { version = "1.2", optional = true, features = ["chrono04"] }
 
 # for image encoding
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 # for SEP-2322 requestState integrity sealing (opt-in via the `request-state` feature)
 hmac = { version = "0.13", optional = true }
@@ -242,6 +242,11 @@ required-features = [
 path = "tests/test_with_js.rs"
 
 [[test]]
+name = "test_local_client_handler"
+required-features = ["client", "local"]
+path = "tests/test_local_client_handler.rs"
+
+[[test]]
 name = "test_notification"
 required-features = ["server", "client"]
 path = "tests/test_notification.rs"
@@ -387,6 +392,11 @@ path = "tests/test_sse_concurrent_streams.rs"
 name = "test_client_credentials"
 required-features = ["auth"]
 path = "tests/test_client_credentials.rs"
+
+[[test]]
+name = "test_auth_error_classification"
+required-features = ["auth", "client", "transport-streamable-http-client"]
+path = "tests/test_auth_error_classification.rs"
 
 [[test]]
 name = "test_unix_socket_transport"

@@ -11,6 +11,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(server)* Normalise bare boolean subschemas (`true` / `false`) in generated `inputSchema`, `outputSchema`, and `ElicitationSchema` to their object-form equivalents (`{}` / `{"not": {}}`) before serialisation. Triggered by `serde_json::Value` field expansions, `Vec<serde_json::Value>`, `BTreeMap<String, serde_json::Value>`, and `#[serde(deny_unknown_fields)]`. Claude Code's `LocalMcpServerManager` schema walker throws `TypeError: Cannot use 'in' operator to search for 'properties' in <bool>` on bare booleans, silently dropping the entire server's tool list ([anthropics/claude-code#50194](https://github.com/anthropics/claude-code/issues/50194), [#25081](https://github.com/anthropics/claude-code/issues/25081)). The fix is unconditional — boolean subschemas are spec-legal per JSON Schema 2020-12 §4.3.2, but real-world MCP clients can't always handle them, so emit object form universally.
 
+## [3.1.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.0.1...rmcp-v3.1.0) - 2026-07-31
+
+### Added
+
+- classify authorization-required errors ([#1056](https://github.com/modelcontextprotocol/rust-sdk/pull/1056))
+- add strict stateless protocol metadata validation ([#1091](https://github.com/modelcontextprotocol/rust-sdk/pull/1091))
+- SEP-2260 stream-based enforcement of client receive-side request association ([#1055](https://github.com/modelcontextprotocol/rust-sdk/pull/1055))
+
+### Fixed
+
+- *(model)* decode metadata-bearing input-required results affecting mrtr ([#1097](https://github.com/modelcontextprotocol/rust-sdk/pull/1097))
+- require metadata for modern HTTP requests ([#1089](https://github.com/modelcontextprotocol/rust-sdk/pull/1089))
+- honor supported_protocol_versions when negotiating initialize ([#1093](https://github.com/modelcontextprotocol/rust-sdk/pull/1093))
+
+### Other
+
+- document the ping utility with examples ([#1106](https://github.com/modelcontextprotocol/rust-sdk/pull/1106))
+- complete Tier 1 feature docs and finalize roadmap ([#1101](https://github.com/modelcontextprotocol/rust-sdk/pull/1101))
+- *(conformance)* meeting requirements for tier 1 ([#1087](https://github.com/modelcontextprotocol/rust-sdk/pull/1087))
+
+## [3.0.1](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.0.0...rmcp-v3.0.1) - 2026-07-29
+
+### Fixed
+
+- *(auth)* use discovered resource for token refresh ([#1084](https://github.com/modelcontextprotocol/rust-sdk/pull/1084))
+- return header mismatch for missing protocol header ([#1083](https://github.com/modelcontextprotocol/rust-sdk/pull/1083))
+- negotiate stateless initialize versions ([#1080](https://github.com/modelcontextprotocol/rust-sdk/pull/1080))
+- stamp server info on graceful subscription results ([#1078](https://github.com/modelcontextprotocol/rust-sdk/pull/1078))
+
+## [3.0.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.0.0-beta.5...rmcp-v3.0.0) - 2026-07-28
+
+### Fixed
+
+- recognize 2026 MCP methods ([#1076](https://github.com/modelcontextprotocol/rust-sdk/pull/1076))
+
+## [3.0.0-beta.5](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.0.0-beta.4...rmcp-v3.0.0-beta.5) - 2026-07-28
+
+### Fixed
+
+- [**breaking**] remove server_info from DiscoverResult ([#1065](https://github.com/modelcontextprotocol/rust-sdk/pull/1065))
+- preserve transient OAuth discovery HTTP errors ([#1071](https://github.com/modelcontextprotocol/rust-sdk/pull/1071))
+- [**breaking**] preserve OAuth discovery transport errors ([#1069](https://github.com/modelcontextprotocol/rust-sdk/pull/1069))
+- gate client handler bounds for local ([#1068](https://github.com/modelcontextprotocol/rust-sdk/pull/1068))
+
+### Other
+
+- prepare for stable 3.0 release ([#1073](https://github.com/modelcontextprotocol/rust-sdk/pull/1073))
+- RFC 9728 resource is used instead of base url when possible ([#962](https://github.com/modelcontextprotocol/rust-sdk/pull/962))
+- [**breaking**] remove deprecated v3 APIs ([#1066](https://github.com/modelcontextprotocol/rust-sdk/pull/1066))
+
+## [3.0.0-beta.4](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.0.0-beta.3...rmcp-v3.0.0-beta.4) - 2026-07-28
+
+### Fixed
+
+- accept namespaced discovery server information ([#1044](https://github.com/modelcontextprotocol/rust-sdk/pull/1044))
+
+### Other
+
+- *(deps)* update base64 requirement from 0.22 to 0.23 ([#1059](https://github.com/modelcontextprotocol/rust-sdk/pull/1059))
+- *(deps)* update jsonwebtoken requirement from 10 to 11 ([#1058](https://github.com/modelcontextprotocol/rust-sdk/pull/1058))
+
 ## [3.0.0-beta.3](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.0.0-beta.2...rmcp-v3.0.0-beta.3) - 2026-07-27
 
 ### Fixed

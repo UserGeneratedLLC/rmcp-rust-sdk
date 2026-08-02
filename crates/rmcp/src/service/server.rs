@@ -85,13 +85,6 @@ pub enum ServerInitializeError {
     #[error("expect initialized request, but received: {0:?}")]
     ExpectedInitializeRequest(Option<ClientJsonRpcMessage>),
 
-    #[deprecated(
-        since = "1.4.0",
-        note = "The server no longer gates on the initialized notification. This variant is never constructed and will be removed in a future major release."
-    )]
-    #[error("expect initialized notification, but received: {0:?}")]
-    ExpectedInitializedNotification(Option<ClientJsonRpcMessage>),
-
     #[error("connection closed: {0}")]
     ConnectionClosed(String),
 
@@ -100,13 +93,6 @@ pub enum ServerInitializeError {
 
     #[error("initialize failed: {0}")]
     InitializeFailed(ErrorData),
-
-    #[deprecated(
-        since = "1.8.0",
-        note = "Negotiation now falls back to the server-configured version. This variant is never constructed and will be removed in a future major release."
-    )]
-    #[error("unsupported protocol version: {0}")]
-    UnsupportedProtocolVersion(ProtocolVersion),
 
     #[error("Send message error {error}, when {context}")]
     TransportError {
@@ -474,12 +460,18 @@ where
     }
 }
 
-/// Echoes the client-requested version if known; otherwise returns `server_fallback`.
+/// Echoes the client-requested version if the server supports it; otherwise
+/// returns `server_fallback`.
+///
+/// `server_supported` comes from [`Service::supported_protocol_versions`], so a
+/// server that narrows that list is never made to answer `initialize` with a
+/// version it cannot serve.
 pub(crate) fn negotiate_protocol_version(
     client_requested: &ProtocolVersion,
     server_fallback: ProtocolVersion,
+    server_supported: &[ProtocolVersion],
 ) -> ProtocolVersion {
-    if ProtocolVersion::KNOWN_VERSIONS.contains(client_requested) {
+    if server_supported.contains(client_requested) {
         client_requested.clone()
     } else {
         tracing::warn!(
@@ -592,8 +584,11 @@ where
             return Err(ServerInitializeError::InitializeFailed(e));
         }
     };
-    init_response.protocol_version =
-        negotiate_protocol_version(&requested_protocol_version, init_response.protocol_version);
+    init_response.protocol_version = negotiate_protocol_version(
+        &requested_protocol_version,
+        init_response.protocol_version,
+        &service.supported_protocol_versions(),
+    );
     // Update peer_info so context.protocol_version() reflects the negotiated
     // version in all subsequent request handlers.
     negotiated_peer_info.protocol_version = init_response.protocol_version.clone();

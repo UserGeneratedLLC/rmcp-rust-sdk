@@ -503,9 +503,9 @@ pub struct JsonRpcResponse<R = JsonObject> {
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct JsonRpcError {
     pub jsonrpc: JsonRpcVersion2_0,
-    // MCP 2025-11-25 §Error Responses: `id` is optional and omitted when the
+    // MCP 2026-07-28 §Error Responses: `id` is optional and omitted when the
     // server cannot read the request id (e.g. parse error / invalid request).
-    // https://modelcontextprotocol.io/specification/2025-11-25/basic#error-responses
+    // https://modelcontextprotocol.io/specification/2026-07-28/basic#error-responses
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RequestId>,
     pub error: ErrorData,
@@ -1029,10 +1029,6 @@ impl RequestParamsMeta for InitializeRequestParams {
     }
 }
 
-/// Deprecated: Use [`InitializeRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use InitializeRequestParams instead")]
-pub type InitializeRequestParam = InitializeRequestParams;
-
 /// The server's response to an initialization request.
 ///
 /// Contains the server's protocol version, capabilities, and implementation
@@ -1089,6 +1085,66 @@ impl InitializeResult {
 pub type ServerInfo = InitializeResult;
 pub type ClientInfo = InitializeRequestParams;
 
+/// Information negotiated about a server peer.
+///
+/// Unlike [`InitializeResult`], the server implementation identity is optional
+/// because discovery responses are not required to provide it.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ServerPeerInfo {
+    /// The negotiated MCP protocol version.
+    pub protocol_version: ProtocolVersion,
+    /// The capabilities this server provides.
+    pub capabilities: ServerCapabilities,
+    /// Information about the server implementation, when provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_info: Option<Implementation>,
+    /// Optional human-readable instructions about using this server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Protocol-level response metadata.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<MetaObject>,
+}
+
+impl ServerPeerInfo {
+    /// Create peer information without a server implementation identity.
+    pub fn new(protocol_version: ProtocolVersion, capabilities: ServerCapabilities) -> Self {
+        Self {
+            protocol_version,
+            capabilities,
+            server_info: None,
+            instructions: None,
+            meta: None,
+        }
+    }
+
+    /// Set the server implementation identity.
+    pub fn with_server_info(mut self, server_info: Implementation) -> Self {
+        self.server_info = Some(server_info);
+        self
+    }
+
+    /// Set instructions supplied by the server.
+    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
+    }
+}
+
+impl From<InitializeResult> for ServerPeerInfo {
+    fn from(result: InitializeResult) -> Self {
+        Self {
+            protocol_version: result.protocol_version,
+            capabilities: result.capabilities,
+            server_info: Some(result.server_info),
+            instructions: result.instructions,
+            meta: result.meta,
+        }
+    }
+}
+
 const_string!(DiscoverRequestMethod = "server/discover");
 
 /// Parameters for [`DiscoverRequest`].
@@ -1120,9 +1176,9 @@ impl schemars::JsonSchema for DiscoverRequestParams {
 pub type DiscoverRequest = Request<DiscoverRequestMethod, DiscoverRequestParams>;
 
 /// The server's response to a [`DiscoverRequest`].
-#[derive(Debug, Serialize, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct DiscoverResult {
     /// Identifies how the result should be parsed.
@@ -1131,8 +1187,6 @@ pub struct DiscoverResult {
     pub supported_versions: Vec<ProtocolVersion>,
     /// Capabilities provided by this server.
     pub capabilities: ServerCapabilities,
-    /// Information about the server implementation.
-    pub server_info: Implementation,
     /// Optional guidance for using the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -1145,70 +1199,47 @@ pub struct DiscoverResult {
     pub meta: Option<MetaObject>,
 }
 
-impl<'de> Deserialize<'de> for DiscoverResult {
-    fn deserialize<__D>(deserializer: __D) -> Result<Self, __D::Error>
-    where
-        __D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Helper {
-            result_type: ResultType,
-            supported_versions: Vec<ProtocolVersion>,
-            capabilities: ServerCapabilities,
-            server_info: Option<Implementation>,
-            instructions: Option<String>,
-            ttl_ms: u64,
-            cache_scope: CacheScope,
-            #[serde(rename = "_meta")]
-            meta: Option<MetaObject>,
-        }
+const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
-        let helper = Helper::deserialize(deserializer)?;
-        let server_info = match helper.server_info {
-            Some(server_info) => server_info,
-            None => {
-                let metadata_server_info = helper
-                    .meta
-                    .as_ref()
-                    .and_then(|metadata| metadata.0.get("io.modelcontextprotocol/serverInfo"))
-                    .ok_or_else(|| serde::de::Error::missing_field("serverInfo"))?;
+fn server_info_from_meta(meta: &MetaObject) -> Option<Implementation> {
+    meta.get(SERVER_INFO_META_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
 
-                serde_json::from_value(metadata_server_info.clone())
-                    .map_err(serde::de::Error::custom)?
-            }
-        };
-
-        Ok(Self {
-            result_type: helper.result_type,
-            supported_versions: helper.supported_versions,
-            capabilities: helper.capabilities,
-            server_info,
-            instructions: helper.instructions,
-            ttl_ms: helper.ttl_ms,
-            cache_scope: helper.cache_scope,
-            meta: helper.meta,
-        })
-    }
+fn set_server_info_on_meta(meta: &mut MetaObject, server_info: Implementation) {
+    let server_info =
+        serde_json::to_value(server_info).expect("Implementation serialization cannot fail");
+    meta.insert(SERVER_INFO_META_KEY.to_owned(), server_info);
 }
 
 impl DiscoverResult {
     /// Create a non-cacheable private discovery result.
-    pub fn new(
-        supported_versions: Vec<ProtocolVersion>,
-        capabilities: ServerCapabilities,
-        server_info: Implementation,
-    ) -> Self {
+    pub fn new(supported_versions: Vec<ProtocolVersion>, capabilities: ServerCapabilities) -> Self {
         Self {
             result_type: ResultType::COMPLETE,
             supported_versions,
             capabilities,
-            server_info,
             instructions: None,
             ttl_ms: 0,
             cache_scope: CacheScope::Private,
             meta: None,
         }
+    }
+
+    /// Return the server implementation information stored in result metadata.
+    pub fn server_info(&self) -> Option<Implementation> {
+        server_info_from_meta(self.meta.as_ref()?)
+    }
+
+    /// Store server implementation information in result metadata.
+    pub fn set_server_info(&mut self, server_info: Implementation) {
+        set_server_info_on_meta(self.meta.get_or_insert_default(), server_info);
+    }
+
+    /// Store server implementation information in result metadata.
+    pub fn with_server_info(mut self, server_info: Implementation) -> Self {
+        self.set_server_info(server_info);
+        self
     }
 
     /// Create a discovery result from the server's initialization information.
@@ -1223,9 +1254,16 @@ impl DiscoverResult {
             meta,
             ..
         } = server_info;
-        let mut result = Self::new(supported_versions, capabilities, server_info);
-        result.instructions = instructions;
-        result.meta = meta;
+        let mut result = Self {
+            result_type: ResultType::COMPLETE,
+            supported_versions,
+            capabilities,
+            instructions,
+            ttl_ms: 0,
+            cache_scope: CacheScope::Private,
+            meta,
+        };
+        result.set_server_info(server_info);
         result
     }
 
@@ -1239,6 +1277,20 @@ impl DiscoverResult {
     pub fn with_cache_scope(mut self, cache_scope: CacheScope) -> Self {
         self.cache_scope = cache_scope;
         self
+    }
+}
+
+impl ServerPeerInfo {
+    /// Create peer information from a discovery result and the selected version.
+    pub fn from_discover_result(protocol_version: ProtocolVersion, result: DiscoverResult) -> Self {
+        let server_info = result.server_info();
+        Self {
+            protocol_version,
+            capabilities: result.capabilities,
+            server_info,
+            instructions: result.instructions,
+            meta: result.meta,
+        }
     }
 }
 
@@ -1437,9 +1489,6 @@ impl RequestParamsMeta for PaginatedRequestParams {
     }
 }
 
-/// Deprecated: Use [`PaginatedRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use PaginatedRequestParams instead")]
-pub type PaginatedRequestParam = PaginatedRequestParams;
 // =============================================================================
 // PROGRESS AND PAGINATION
 // =============================================================================
@@ -1541,7 +1590,7 @@ macro_rules! paginated_result {
             /// the server handler clears the field when responding to peers that
             /// negotiated an older version.
             ///
-            /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5bed7b30527019e34ccb0eb474636651424501f6/schema/draft/schema.ts#L225-L234
+            /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/271ecc9accafdd9b83a3c869fa67c22953b2af80/schema/2026-07-28/schema.ts#L219-L235
             #[serde(default, skip_serializing_if = "Option::is_none")]
             pub result_type: Option<ResultType>,
             #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -1680,10 +1729,6 @@ impl RequestParamsMeta for ReadResourceRequestParams {
     }
 }
 
-/// Deprecated: Use [`ReadResourceRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use ReadResourceRequestParams instead")]
-pub type ReadResourceRequestParam = ReadResourceRequestParams;
-
 /// Result containing the contents of a read resource
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1699,7 +1744,7 @@ pub struct ReadResourceResult {
     /// the server handler clears the field when responding to peers that
     /// negotiated an older version.
     ///
-    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5bed7b30527019e34ccb0eb474636651424501f6/schema/draft/schema.ts#L225-L234
+    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/271ecc9accafdd9b83a3c869fa67c22953b2af80/schema/2026-07-28/schema.ts#L219-L235
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_type: Option<ResultType>,
     /// Time, in milliseconds, that this result may be treated as fresh (SEP-2549).
@@ -1788,10 +1833,6 @@ impl RequestParamsMeta for SubscribeRequestParams {
     }
 }
 
-/// Deprecated: Use [`SubscribeRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use SubscribeRequestParams instead")]
-pub type SubscribeRequestParam = SubscribeRequestParams;
-
 /// Request to subscribe to resource updates
 #[deprecated(
     note = "resources/subscribe is legacy-only; use subscriptions/listen for protocol version 2026-07-28"
@@ -1830,10 +1871,6 @@ impl RequestParamsMeta for UnsubscribeRequestParams {
         &mut self.meta
     }
 }
-
-/// Deprecated: Use [`UnsubscribeRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use UnsubscribeRequestParams instead")]
-pub type UnsubscribeRequestParam = UnsubscribeRequestParams;
 
 /// Request to unsubscribe from resource updates
 #[deprecated(
@@ -2065,7 +2102,7 @@ fn subscriptions_listen_request_meta_schema(
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct SubscriptionsListenRequestParams {
-    /// Protocol-level metadata. Required by the draft wire schema.
+    /// Protocol-level metadata. Required by the 2026-07-28 wire schema.
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(
         feature = "schemars",
@@ -2139,6 +2176,16 @@ impl SubscriptionsListenResultMeta {
             subscription_id.into_json_value(),
         );
     }
+
+    /// Return the server implementation information stored in result metadata.
+    pub fn server_info(&self) -> Option<Implementation> {
+        server_info_from_meta(&self.0)
+    }
+
+    /// Store server implementation information in result metadata.
+    pub fn set_server_info(&mut self, server_info: Implementation) {
+        set_server_info_on_meta(&mut self.0, server_info);
+    }
 }
 
 impl<'de> Deserialize<'de> for SubscriptionsListenResultMeta {
@@ -2177,9 +2224,14 @@ impl schemars::JsonSchema for SubscriptionsListenResultMeta {
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let subscription_id = generator.subschema_for::<RequestId>();
+        let server_info = generator.subschema_for::<Implementation>();
         schemars::json_schema!({
             "type": "object",
             "properties": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "description": "Identifies the server software producing the response. Servers SHOULD include this field on every response unless specifically configured not to do so.",
+                    "allOf": [server_info],
+                },
                 "io.modelcontextprotocol/subscriptionId": subscription_id,
             },
             "required": ["io.modelcontextprotocol/subscriptionId"],
@@ -2333,10 +2385,6 @@ impl RequestParamsMeta for GetPromptRequestParams {
     }
 }
 
-/// Deprecated: Use [`GetPromptRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use GetPromptRequestParams instead")]
-pub type GetPromptRequestParam = GetPromptRequestParams;
-
 /// Request to get a specific prompt
 pub type GetPromptRequest = Request<GetPromptRequestMethod, GetPromptRequestParams>;
 
@@ -2405,10 +2453,6 @@ impl RequestParamsMeta for SetLevelRequestParams {
         &mut self.meta
     }
 }
-
-/// Deprecated: Use [`SetLevelRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use SetLevelRequestParams instead")]
-pub type SetLevelRequestParam = SetLevelRequestParams;
 
 /// Request to set the logging level
 #[deprecated(
@@ -2678,9 +2722,6 @@ pub enum SamplingMessageContentBlock {
     /// User only
     ToolResult(ToolResultContent),
 }
-
-#[deprecated(since = "2.0.0", note = "Renamed to SamplingMessageContentBlock")]
-pub type SamplingMessageContent = SamplingMessageContentBlock;
 
 impl SamplingMessageContentBlock {
     /// Create a text content
@@ -3008,10 +3049,6 @@ impl CreateMessageRequestParams {
     }
 }
 
-/// Deprecated: Use [`CreateMessageRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use CreateMessageRequestParams instead")]
-pub type CreateMessageRequestParam = CreateMessageRequestParams;
-
 /// Preferences for model selection and behavior in sampling requests.
 ///
 /// This allows servers to express their preferences for which model to use
@@ -3201,10 +3238,6 @@ impl RequestParamsMeta for CompleteRequestParams {
     }
 }
 
-/// Deprecated: Use [`CompleteRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use CompleteRequestParams instead")]
-pub type CompleteRequestParam = CompleteRequestParams;
-
 pub type CompleteRequest = Request<CompleteRequestMethod, CompleteRequestParams>;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -3300,7 +3333,7 @@ pub struct CompleteResult {
     /// the server handler clears the field when responding to peers that
     /// negotiated an older version.
     ///
-    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5bed7b30527019e34ccb0eb474636651424501f6/schema/draft/schema.ts#L225-L234
+    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/271ecc9accafdd9b83a3c869fa67c22953b2af80/schema/2026-07-28/schema.ts#L219-L235
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_type: Option<ResultType>,
     pub completion: CompletionInfo,
@@ -3390,9 +3423,6 @@ impl ResourceTemplateReference {
         Self { uri: uri.into() }
     }
 }
-
-#[deprecated(since = "2.0.0", note = "Renamed to ResourceTemplateReference")]
-pub type ResourceReference = ResourceTemplateReference;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -3545,21 +3575,20 @@ pub enum ElicitationAction {
     Cancel,
 }
 
-/// Helper enum for deserializing CreateElicitationRequestParam with backward compatibility.
-/// When mode is missing, it defaults to FormElicitationParam.
+/// Wire representation for tagged elicitation parameters and legacy forms without `mode`.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "mode")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-enum CreateElicitationRequestParamDeserializeHelper {
+enum ElicitRequestParamsWire {
     #[serde(rename = "form", rename_all = "camelCase")]
-    FormElicitationParam {
+    Form {
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<RequestMetaObject>,
         message: String,
         requested_schema: ElicitationSchema,
     },
     #[serde(rename = "url", rename_all = "camelCase")]
-    UrlElicitationParam {
+    Url {
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<RequestMetaObject>,
         message: String,
@@ -3567,7 +3596,7 @@ enum CreateElicitationRequestParamDeserializeHelper {
         elicitation_id: String,
     },
     #[serde(untagged, rename_all = "camelCase")]
-    FormElicitationParamBackwardsCompat {
+    LegacyForm {
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<RequestMetaObject>,
         message: String,
@@ -3575,19 +3604,17 @@ enum CreateElicitationRequestParamDeserializeHelper {
     },
 }
 
-impl TryFrom<CreateElicitationRequestParamDeserializeHelper> for ElicitRequestParams {
+impl TryFrom<ElicitRequestParamsWire> for ElicitRequestParams {
     type Error = serde_json::Error;
 
-    fn try_from(
-        value: CreateElicitationRequestParamDeserializeHelper,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(value: ElicitRequestParamsWire) -> Result<Self, Self::Error> {
         match value {
-            CreateElicitationRequestParamDeserializeHelper::FormElicitationParam {
+            ElicitRequestParamsWire::Form {
                 meta,
                 message,
                 requested_schema,
             }
-            | CreateElicitationRequestParamDeserializeHelper::FormElicitationParamBackwardsCompat {
+            | ElicitRequestParamsWire::LegacyForm {
                 meta,
                 message,
                 requested_schema,
@@ -3596,7 +3623,7 @@ impl TryFrom<CreateElicitationRequestParamDeserializeHelper> for ElicitRequestPa
                 message,
                 requested_schema,
             }),
-            CreateElicitationRequestParamDeserializeHelper::UrlElicitationParam {
+            ElicitRequestParamsWire::Url {
                 meta,
                 message,
                 url,
@@ -3642,10 +3669,7 @@ impl TryFrom<CreateElicitationRequestParamDeserializeHelper> for ElicitRequestPa
 /// };
 /// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-#[serde(
-    tag = "mode",
-    try_from = "CreateElicitationRequestParamDeserializeHelper"
-)]
+#[serde(tag = "mode", try_from = "ElicitRequestParamsWire")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ElicitRequestParams {
@@ -3697,13 +3721,6 @@ impl RequestParamsMeta for ElicitRequestParams {
     }
 }
 
-/// Deprecated: Use [`ElicitRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use ElicitRequestParams instead")]
-pub type CreateElicitationRequestParam = ElicitRequestParams;
-
-#[deprecated(since = "2.0.0", note = "Renamed to ElicitRequestParams")]
-pub type CreateElicitationRequestParams = ElicitRequestParams;
-
 /// The result returned by a client in response to an elicitation request.
 ///
 /// Contains the user's decision (accept/decline/cancel) and optionally their input data
@@ -3750,14 +3767,8 @@ impl ElicitResult {
     }
 }
 
-#[deprecated(since = "2.0.0", note = "Renamed to ElicitResult")]
-pub type CreateElicitationResult = ElicitResult;
-
 /// Request type for creating an elicitation to gather user input
 pub type ElicitRequest = Request<ElicitationCreateRequestMethod, ElicitRequestParams>;
-
-#[deprecated(since = "2.0.0", note = "Renamed to ElicitRequest")]
-pub type CreateElicitationRequest = ElicitRequest;
 
 // =============================================================================
 // TOOL EXECUTION RESULTS
@@ -3781,7 +3792,7 @@ pub struct CallToolResult {
     /// the server handler clears the field when responding to peers that
     /// negotiated an older version.
     ///
-    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5bed7b30527019e34ccb0eb474636651424501f6/schema/draft/schema.ts#L225-L234
+    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/271ecc9accafdd9b83a3c869fa67c22953b2af80/schema/2026-07-28/schema.ts#L219-L235
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_type: Option<ResultType>,
     /// The content returned by the tool (text, images, etc.)
@@ -3803,6 +3814,8 @@ pub struct CallToolResult {
 // 2. Requires at least one known field to be present, so that `CallToolResult` doesn't
 //    greedily match arbitrary JSON objects when used inside `#[serde(untagged)]` enums
 //    (e.g. `ServerResult`), which would shadow `CustomResult`.
+// 3. Rejects `resultType: "input_required"` so untagged `ServerResult`
+//    decoding selects `InputRequiredResult` and preserves input requests and state.
 impl<'de> Deserialize<'de> for CallToolResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -3821,6 +3834,16 @@ impl<'de> Deserialize<'de> for CallToolResult {
         }
 
         let helper = Helper::deserialize(deserializer)?;
+
+        if helper
+            .result_type
+            .as_ref()
+            .is_some_and(ResultType::is_input_required)
+        {
+            return Err(serde::de::Error::custom(
+                "CallToolResult cannot use resultType \"input_required\"",
+            ));
+        }
 
         if helper.content.is_none()
             && helper.structured_content.is_none()
@@ -4088,10 +4111,6 @@ impl RequestParamsMeta for CallToolRequestParams {
     }
 }
 
-/// Deprecated: Use [`CallToolRequestParams`] instead (SEP-1319 compliance).
-#[deprecated(since = "0.13.0", note = "Use CallToolRequestParams instead")]
-pub type CallToolRequestParam = CallToolRequestParams;
-
 /// Request to call a specific tool
 pub type CallToolRequest = Request<CallToolRequestMethod, CallToolRequestParams>;
 
@@ -4169,7 +4188,7 @@ pub struct GetPromptResult {
     /// the server handler clears the field when responding to peers that
     /// negotiated an older version.
     ///
-    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5bed7b30527019e34ccb0eb474636651424501f6/schema/draft/schema.ts#L225-L234
+    /// [spec schema]: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/271ecc9accafdd9b83a3c869fa67c22953b2af80/schema/2026-07-28/schema.ts#L219-L235
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_type: Option<ResultType>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4625,14 +4644,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    #[allow(deprecated)]
-    fn deprecated_aliases_still_resolve() {
-        // 하위호환: 구 이름이 새 타입으로 여전히 resolve되는지 확인.
-        let _: CreateElicitationResult = ElicitResult::new(ElicitationAction::Accept);
-        let _: ResourceReference = ResourceTemplateReference::new("res://x");
-    }
-
     #[cfg(feature = "transport-streamable-http-client")]
     #[test]
     fn transport_closed_marker_accepts_only_the_process_local_token() {
@@ -4853,12 +4864,11 @@ mod tests {
             serde_json::from_value(request.clone()).expect("invalid request");
         let (request, id) = request.into_request().expect("should be a request");
         assert_eq!(id, RequestId::Number(1));
-        #[allow(deprecated)]
         match request {
             ClientRequest::InitializeRequest(Request {
                 method: _,
                 params:
-                    InitializeRequestParam {
+                    InitializeRequestParams {
                         meta: _,
                         protocol_version: _,
                         capabilities,
@@ -5124,8 +5134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_elicitation_deserialization_untagged() {
-        // Test deserialization without the "type" field (should default to FormElicitationParam)
+    fn elicitation_without_mode_deserializes_as_form() {
         let json_data_without_tag = json!({
             "message": "Please provide more details.",
             "requestedSchema": {
@@ -5151,7 +5160,7 @@ mod tests {
             assert_eq!(requested_schema.title, Some(Cow::from("User Details")));
             assert_eq!(requested_schema.type_, ObjectTypeConst);
         } else {
-            panic!("Expected FormElicitationParam");
+            panic!("Expected FormElicitationParams");
         }
     }
 
@@ -5189,7 +5198,7 @@ mod tests {
             assert_eq!(requested_schema.title, Some(Cow::from("User Details")));
             assert_eq!(requested_schema.type_, ObjectTypeConst);
         } else {
-            panic!("Expected FormElicitationParam");
+            panic!("Expected FormElicitationParams");
         }
 
         let json_data_url = json!({
@@ -5218,7 +5227,7 @@ mod tests {
             assert_eq!(url, "https://example.com/form");
             assert_eq!(elicitation_id, "elicitation-123");
         } else {
-            panic!("Expected UrlElicitationParam");
+            panic!("Expected UrlElicitationParams");
         }
     }
 

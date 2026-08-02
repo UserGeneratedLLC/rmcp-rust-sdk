@@ -1,6 +1,6 @@
 # Model Context Protocol OAuth Authorization
 
-This document describes the OAuth 2.1 authorization implementation for Model Context Protocol (MCP), following the [MCP Authorization Specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/).
+This document describes the OAuth 2.1 authorization implementation for Model Context Protocol (MCP), following the [MCP Authorization Specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/).
 
 ## Features
 
@@ -61,7 +61,9 @@ have been obtained.
 If OAuth requests must run outside reqwest, implement `OAuthHttpClient` and use
 `OAuthState::new_with_oauth_http_client`. The SDK passes each OAuth request to
 your implementation with the raw HTTP request, a suggested timeout, and an
-`OAuthHttpRedirectPolicy`.
+`OAuthHttpRedirectPolicy`. `OAuthHttpClientFuture` returns
+`OAuthHttpClientError`, so implementations can propagate their native error
+types with `?` without flattening their source chains into strings.
 
 ```rust ignore
 use std::sync::Arc;
@@ -158,7 +160,7 @@ distinguish server-published metadata from synthesized metadata.
 The `OAuthState` state machine manages the full authorization lifecycle.
 `start_authorization` accepts an `AuthorizationRequest` describing the client
 identity material you have available, and selects a client registration
-mechanism following the [spec's priority order](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration):
+mechanism following the [spec's priority order](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration):
 
 1. **Pre-registered client information** (`with_preregistered_client`), when
    the client already holds a `client_id` issued out of band
@@ -254,6 +256,26 @@ let client_service = ClientInfo::default();
 let client = client_service.serve(transport).await?;
 ```
 
+If initialization reports that authorization is required, return to the
+application's authorization flow:
+
+```rust ignore
+let client = match client_service.serve(transport).await {
+    Ok(client) => client,
+    Err(error) if error.is_authorization_required() => {
+        // Prompt the user and start the application's authorization flow again.
+        return Err(error.into());
+    }
+    Err(error) => return Err(error.into()),
+};
+```
+
+The predicate covers both missing or expired local OAuth authorization and an
+HTTP 401 challenge from the MCP server. Other failures, including transient
+token-refresh errors and insufficient scope, return `false`. The original error
+is preserved for logging or more detailed handling; the SDK does not start an
+authorization flow automatically.
+
 ### 6. Handle scope upgrades
 
 If a server returns 403 with `insufficient_scope`, you can request a scope
@@ -329,7 +351,7 @@ If you encounter authorization issues, check the following:
 
 ## References
 
-- [MCP Authorization Specification](https://modelcontextprotocol.io/specification/draft/basic/authorization/)
+- [MCP Authorization Specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/)
 - [OAuth 2.1 Specification Draft](https://oauth.net/2.1/)
 - [RFC 8414: OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414)
 - [RFC 7591: OAuth 2.0 Dynamic Client Registration Protocol](https://datatracker.ietf.org/doc/html/rfc7591)

@@ -154,7 +154,8 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                             McpError::method_not_found::<SubscriptionsListenRequestMethod>(),
                         );
                     };
-                    let advertised = requested.supported_by(&self.get_info().capabilities);
+                    let server_info = self.get_info();
+                    let advertised = requested.supported_by(&server_info.capabilities);
                     let handler_accepted = requested.intersection(&candidate);
                     let accepted = handler_accepted.intersection(&advertised);
                     if accepted != handler_accepted {
@@ -168,15 +169,16 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                             "subscription filter reduced to advertised server capabilities"
                         );
                     }
+                    let server_implementation = server_info.server_info;
                     let subscription_id = context.id.clone();
                     let subscription =
                         SubscriptionContext::establish(context, requested, accepted).await?;
-                    // The integrated draft schema defines a final result for graceful
+                    // The 2026-07-28 schema defines a final result for graceful
                     // server teardown; explicit stdio cancellation remains a notification.
                     self.listen(subscription).await.map(|()| {
-                        ServerResult::SubscriptionsListenResult(
-                            SubscriptionsListenResult::complete(subscription_id),
-                        )
+                        let mut result = SubscriptionsListenResult::complete(subscription_id);
+                        result.meta.set_server_info(server_implementation);
+                        ServerResult::SubscriptionsListenResult(result)
                     })
                 }
             }
@@ -298,6 +300,10 @@ impl<H: ServerHandler> Service<RoleServer> for H {
     fn get_info(&self) -> <RoleServer as ServiceRole>::Info {
         self.get_info()
     }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        ServerHandler::supported_protocol_versions(self)
+    }
 }
 
 macro_rules! server_handler_methods {
@@ -319,10 +325,17 @@ macro_rules! server_handler_methods {
             info.protocol_version = negotiate_protocol_version(
                 &request.protocol_version,
                 info.protocol_version,
+                &self.supported_protocol_versions(),
             );
             std::future::ready(Ok(info))
         }
         /// Return the protocol versions supported by this server.
+        ///
+        /// Defaults to every version this SDK knows. Override it to narrow the
+        /// set to the revisions the server actually implements: the returned
+        /// list is advertised by [`Self::discover`], bounds what `initialize`
+        /// negotiation may agree to, and is what per-request versions are
+        /// validated against.
         fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
             Cow::Borrowed(ProtocolVersion::KNOWN_VERSIONS)
         }
@@ -405,7 +418,7 @@ macro_rules! server_handler_methods {
         ///
         /// The SDK sends the acknowledgment before invoking this method. Returning
         /// `Ok(())` sends the final [`SubscriptionsListenResult`] defined by the
-        /// integrated draft schema, marking graceful server teardown. Explicit
+        /// 2026-07-28 schema, marking graceful server teardown. Explicit
         /// stdio cancellation uses `notifications/cancelled` instead.
         fn listen(
             &self,

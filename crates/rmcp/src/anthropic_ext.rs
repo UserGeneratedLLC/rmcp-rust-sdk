@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::{ExperimentalCapabilities, JsonObject, Meta, Tool};
+use crate::model::{ExperimentalCapabilities, JsonObject, MetaObject, Tool};
 #[cfg(feature = "server")]
 use crate::{
     RoleServer,
@@ -103,7 +103,7 @@ impl Tool {
     }
 }
 
-/// Build a [`Meta`] carrying the `anthropic/maxResultSizeChars` key for direct
+/// Build a [`MetaObject`] carrying the `anthropic/maxResultSizeChars` key for direct
 /// use in the `#[tool(meta = ...)]` macro attribute. The value is clamped to
 /// [`MAX_RESULT_SIZE_CHARS_CEILING`].
 ///
@@ -125,9 +125,9 @@ impl Tool {
 /// async fn big_output(&self) -> Result<Json<Resp>, String> { /* ... */ }
 /// ```
 #[must_use]
-pub fn anthropic_max_result_size_chars_meta(chars: u32) -> Meta {
+pub fn anthropic_max_result_size_chars_meta(chars: u32) -> MetaObject {
     let clamped = chars.min(MAX_RESULT_SIZE_CHARS_CEILING);
-    let mut meta = Meta::new();
+    let mut meta = MetaObject::new();
     meta.0.insert(
         MAX_RESULT_SIZE_CHARS_META_KEY.to_string(),
         Value::from(clamped),

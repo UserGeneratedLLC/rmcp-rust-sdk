@@ -25,7 +25,7 @@ use crate::{
         NumberOrString, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
         ProtocolVersion, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResponse,
         ReadResourceResult, Reference, RequestId, RequestMetaObject, RootsListChangedNotification,
-        ServerInfo, ServerJsonRpcMessage, ServerNotification, ServerRequest, ServerResult,
+        ServerJsonRpcMessage, ServerNotification, ServerPeerInfo, ServerRequest, ServerResult,
         SetLevelRequest, SetLevelRequestParams, SubscribeRequest, SubscribeRequestParams,
         SubscriptionFilter, SubscriptionsListenRequest, SubscriptionsListenRequestParams,
         SubscriptionsListenResult, UnsubscribeRequest, UnsubscribeRequestParams, UpdateTaskParams,
@@ -110,6 +110,17 @@ impl ClientInitializeError {
             source = current.source();
         }
         None
+    }
+
+    /// Returns whether client initialization failed because authorization is required.
+    ///
+    /// This covers both missing or expired local OAuth authorization and an HTTP
+    /// authorization challenge from the MCP server.
+    pub fn is_authorization_required(&self) -> bool {
+        matches!(
+            self,
+            Self::TransportError { error, .. } if error.is_authorization_required()
+        )
     }
 }
 
@@ -213,7 +224,7 @@ impl ServiceRole for RoleClient {
     type PeerResp = ServerResult;
     type PeerNot = ServerNotification;
     type Info = ClientInfo;
-    type PeerInfo = ServerInfo;
+    type PeerInfo = ServerPeerInfo;
     type InitializeError = ClientInitializeError;
     const IS_CLIENT: bool = true;
 
@@ -238,14 +249,13 @@ impl ServiceRole for RoleClient {
         }
     }
 
-    // SEP-2260: with no outbound request in flight there is nothing the
-    // server request could be associated with, so reject it. With one in
-    // flight we cannot tell which request it belongs to (no wire field), so
-    // we accept — an under-approximation of the spec's SHOULD.
+    // SEP-2260: reject restricted server requests that arrived unassociated
+    // with any in-flight outbound request. Without stream separation
+    // (`Unknown`) the coarse in-flight check under-approximates the SHOULD.
     fn enforce_peer_request_association(
         peer_request: &Self::PeerReq,
         peer_info: Option<&Self::PeerInfo>,
-        has_pending_outbound_request: bool,
+        association: PeerRequestAssociation,
     ) -> Result<(), ErrorData> {
         let restricted = matches!(
             peer_request,
@@ -258,13 +268,24 @@ impl ServiceRole for RoleClient {
         }
         let strict =
             peer_info.is_some_and(|info| info.protocol_version >= ProtocolVersion::V_2026_07_28);
-        if strict && !has_pending_outbound_request {
-            return Err(ErrorData::invalid_params(
+        if !strict {
+            return Ok(());
+        }
+        let associated = match association {
+            PeerRequestAssociation::Associated => true,
+            PeerRequestAssociation::Unassociated => false,
+            PeerRequestAssociation::Unknown {
+                has_pending_outbound_request,
+            } => has_pending_outbound_request,
+        };
+        if associated {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params(
                 "SEP-2260: server-to-client requests must be associated with an in-flight client request",
                 None,
-            ));
+            ))
         }
-        Ok(())
     }
 
     async fn invalidate_response_cache(peer: &Peer<Self>, notification: &Self::PeerNot) {
@@ -776,7 +797,7 @@ where
     let ServerResult::InitializeResult(initialize_result) = response else {
         return Err(ClientInitializeError::ExpectedInitResult(Some(response)));
     };
-    peer.set_peer_info(initialize_result);
+    peer.set_peer_info(initialize_result.into());
 
     // send notification
     let notification = ClientJsonRpcMessage::notification(
@@ -846,13 +867,10 @@ where
                         server_supported: result.supported_versions,
                     });
                 };
-                peer.set_peer_info(ServerInfo {
-                    protocol_version: selected.clone(),
-                    capabilities: result.capabilities,
-                    server_info: result.server_info,
-                    instructions: result.instructions,
-                    meta: result.meta,
-                });
+                peer.set_peer_info(ServerPeerInfo::from_discover_result(
+                    selected.clone(),
+                    result,
+                ));
                 peer.set_client_request_metadata(ClientRequestMetadata {
                     protocol_version: selected,
                     client_info: client_info.client_info.clone(),
@@ -2197,13 +2215,10 @@ mod tests {
         let peer = disconnected_peer();
         let meta = RequestMetaObject::default();
         let key = discover_cache_key();
-        let expected = DiscoverResult::new(
-            vec![ProtocolVersion::default()],
-            Default::default(),
-            crate::model::Implementation::from_build_env(),
-        )
-        .with_ttl_ms(5_000)
-        .with_cache_scope(CacheScope::Public);
+        let expected = DiscoverResult::new(vec![ProtocolVersion::default()], Default::default())
+            .with_server_info(crate::model::Implementation::from_build_env())
+            .with_ttl_ms(5_000)
+            .with_cache_scope(CacheScope::Public);
         peer.cache_response(
             key,
             ServerResult::DiscoverResult(expected.clone()),
@@ -2213,5 +2228,75 @@ mod tests {
         .await;
 
         assert_eq!(peer.discover(meta).await.unwrap(), expected);
+    }
+}
+
+#[cfg(test)]
+mod sep2260_association_tests {
+    use super::*;
+    use crate::{
+        model::{
+            CreateMessageRequest, CreateMessageRequestParams, SamplingMessage, ServerCapabilities,
+        },
+        service::PeerRequestAssociation,
+    };
+
+    fn sampling_request() -> ServerRequest {
+        ServerRequest::CreateMessageRequest(CreateMessageRequest::new(
+            CreateMessageRequestParams::new(vec![SamplingMessage::user_text("hi")], 16),
+        ))
+    }
+
+    fn server_info(version: ProtocolVersion) -> ServerPeerInfo {
+        ServerPeerInfo::new(version, ServerCapabilities::default())
+    }
+
+    fn enforce(
+        info: &ServerPeerInfo,
+        association: PeerRequestAssociation,
+    ) -> Result<(), ErrorData> {
+        RoleClient::enforce_peer_request_association(&sampling_request(), Some(info), association)
+    }
+
+    #[test]
+    fn strict_rejects_unassociated() {
+        let info = server_info(ProtocolVersion::V_2026_07_28);
+        let err = enforce(&info, PeerRequestAssociation::Unassociated).unwrap_err();
+        assert_eq!(err.code, crate::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn strict_accepts_associated() {
+        let info = server_info(ProtocolVersion::V_2026_07_28);
+        assert!(enforce(&info, PeerRequestAssociation::Associated).is_ok());
+    }
+
+    #[test]
+    fn strict_unknown_falls_back_to_coarse_check() {
+        let info = server_info(ProtocolVersion::V_2026_07_28);
+        assert!(
+            enforce(
+                &info,
+                PeerRequestAssociation::Unknown {
+                    has_pending_outbound_request: true
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce(
+                &info,
+                PeerRequestAssociation::Unknown {
+                    has_pending_outbound_request: false
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_protocol_accepts_even_unassociated() {
+        let info = server_info(ProtocolVersion::V_2025_11_25);
+        assert!(enforce(&info, PeerRequestAssociation::Unassociated).is_ok());
     }
 }

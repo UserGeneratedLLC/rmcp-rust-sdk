@@ -51,6 +51,7 @@ impl ServerHandler for ToolsOnlyServer {
                 .enable_tool_list_changed()
                 .build(),
         )
+        .with_server_info(Implementation::new("tools-only-server", "1.0.0"))
     }
 
     fn accepted_subscription_filter(
@@ -262,8 +263,8 @@ impl rmcp::service::Service<RoleServer> for MalformedAcknowledgmentServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ServerResult, rmcp::ErrorData> {
         match request {
-            ClientRequest::DiscoverRequest(_) => {
-                Ok(ServerResult::DiscoverResult(DiscoverResult::new(
+            ClientRequest::DiscoverRequest(_) => Ok(ServerResult::DiscoverResult(
+                DiscoverResult::new(
                     vec![ProtocolVersion::V_2026_07_28],
                     ServerCapabilities::builder()
                         .enable_tools()
@@ -271,9 +272,9 @@ impl rmcp::service::Service<RoleServer> for MalformedAcknowledgmentServer {
                         .enable_prompts()
                         .enable_prompts_list_changed()
                         .build(),
-                    Implementation::new("malformed-ack-server", "1.0.0"),
-                )))
-            }
+                )
+                .with_server_info(Implementation::new("malformed-ack-server", "1.0.0")),
+            )),
             ClientRequest::SubscriptionsListenRequest(_) => {
                 let mut acknowledgment = SubscriptionsAcknowledgedNotification::new(
                     SubscriptionsAcknowledgedNotificationParams::new(
@@ -439,6 +440,13 @@ async fn listen_exposes_acknowledged_filter_and_graceful_result() -> anyhow::Res
     assert_eq!(
         result.meta.subscription_id().as_ref(),
         Some(subscription.id())
+    );
+    assert_eq!(
+        result
+            .meta
+            .server_info()
+            .expect("graceful result should contain valid server info"),
+        Implementation::new("tools-only-server", "1.0.0")
     );
 
     client.cancel().await?;

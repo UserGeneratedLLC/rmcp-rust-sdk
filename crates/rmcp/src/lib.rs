@@ -3,8 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 mod error;
-#[allow(deprecated)]
-pub use error::{Error, ErrorData, RmcpError};
+pub use error::{ErrorData, RmcpError};
 
 /// Claude Code-specific server extensions (maxResultSizeChars, claude/channel).
 /// See <https://docs.claude.com/en/docs/claude-code/mcp>.
