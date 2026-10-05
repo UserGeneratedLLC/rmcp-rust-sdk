@@ -254,6 +254,12 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                 // legacy wire shape without `resultType: "complete"`.
                 if !sep_2322_supported {
                     result.strip_result_type_for_legacy_peer();
+                } else {
+                    // 2026-07-28 requires `ttlMs` + `cacheScope` on list/read
+                    // results (SEP-2549); strict clients reject a result that
+                    // lacks them, so a handler that did not set them gets the
+                    // conservative `ttlMs: 0, cacheScope: "private"`.
+                    result.fill_default_cache_hints_for_modern_peer();
                 }
                 Ok(result)
             }

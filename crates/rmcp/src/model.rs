@@ -4608,6 +4608,26 @@ impl ServerResult {
         };
         result_type.take_if(|result_type| result_type.is_complete());
     }
+
+    /// Fill the SEP-2549 cache hints (`ttlMs`, `cacheScope`) that the
+    /// `2026-07-28` schema requires on every list/read result.
+    ///
+    /// The server handler calls this before responding to a peer that negotiated
+    /// `2026-07-28` or newer. A handler that already chose a value keeps it;
+    /// otherwise the result is marked immediately stale (`ttlMs: 0`) and
+    /// `private`, the same conservative default [`DiscoverResult`] uses.
+    pub fn fill_default_cache_hints_for_modern_peer(&mut self) {
+        let (ttl_ms, cache_scope) = match self {
+            ServerResult::ListToolsResult(r) => (&mut r.ttl_ms, &mut r.cache_scope),
+            ServerResult::ListPromptsResult(r) => (&mut r.ttl_ms, &mut r.cache_scope),
+            ServerResult::ListResourcesResult(r) => (&mut r.ttl_ms, &mut r.cache_scope),
+            ServerResult::ListResourceTemplatesResult(r) => (&mut r.ttl_ms, &mut r.cache_scope),
+            ServerResult::ReadResourceResult(r) => (&mut r.ttl_ms, &mut r.cache_scope),
+            _ => return,
+        };
+        ttl_ms.get_or_insert(0);
+        cache_scope.get_or_insert(CacheScope::Private);
+    }
 }
 
 pub type ServerJsonRpcMessage = JsonRpcMessage<ServerRequest, ServerResult, ServerNotification>;
